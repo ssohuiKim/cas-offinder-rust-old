@@ -38,11 +38,14 @@ struct SearchChunkResult {
     pub data: Box<[u8; SEARCH_CHUNK_SIZE_BYTES]>,
 }
 
-#[derive(Clone, Copy)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 struct SearchMatch {
     pub chunk_idx: u32,
     pub pattern_idx: u32,
     pub mismatches: u32,
+    pub dna_bulge_size: u16,
+    pub rna_bulge_size: u16,
 }
 
 const MAX_QUEUED: usize = 1;
@@ -135,7 +138,9 @@ fn search_device_ocl(
                     SearchMatch {
                         chunk_idx: 0,
                         pattern_idx: 0,
-                        mismatches: 0
+                        mismatches: 0,
+                        dna_bulge_size: 0,
+                        rna_bulge_size: 0,
                     };
                     readsize as usize
                 ];
@@ -289,6 +294,8 @@ fn search_chunk_cpu(
                             chunk_idx: ((gen_idx + o) * NUCL_PER_BLOCK + l) as u32,
                             pattern_idx: j as u32,
                             mismatches: mismatches,
+                            dna_bulge_size: 0,
+                            rna_bulge_size: 0,
                         });
                     }
                 }
@@ -429,6 +436,8 @@ fn convert_matches(
                 is_forward: is_forward,
                 dna_seq: dna_result,
                 rna_seq: rna_result,
+                dna_bulge_size: 0,  // populated by Myers path in later phases
+                rna_bulge_size: 0,
             });
         }
     }

@@ -236,6 +236,45 @@ pub fn cmp_chars(dna: u8, rna: u8) -> bool {
     (dnab & rnab) != 0
 }
 
+/// Determine PAM orientation from search_filter. Returns (is_reversed, pam_len).
+/// A "normal" filter has N-block on the left (guide) and actual bases on right (PAM).
+/// A "reversed" filter has N-block on the right (guide) and actual bases on left (PAM).
+pub fn detect_pam_orientation(search_filter: &[u8]) -> (bool, usize) {
+    let n = search_filter.len();
+    let mut left_ns = 0;
+    for &c in search_filter {
+        if c == b'N' || c == b'n' { left_ns += 1; } else { break; }
+    }
+    let mut right_ns = 0;
+    for &c in search_filter.iter().rev() {
+        if c == b'N' || c == b'n' { right_ns += 1; } else { break; }
+    }
+    if left_ns >= right_ns {
+        // N block on left → PAM on right (normal SpCas9 NGG)
+        (false, n - left_ns)
+    } else {
+        (true, n - right_ns)
+    }
+}
+
+/// Extract the guide portion of a pattern given PAM orientation.
+/// For non-reversed: strip trailing Ns (PAM placeholder).
+/// For reversed: strip leading Ns.
+pub fn extract_guide(pattern: &[u8], is_reversed: bool, pam_len: usize) -> &[u8] {
+    let n = pattern.len();
+    if is_reversed {
+        &pattern[pam_len..]
+    } else {
+        &pattern[..n - pam_len]
+    }
+}
+
+/// Map a single ASCII character to its 4-bit nucleotide encoding.
+/// N/mixed bases expand to union of bits.
+pub fn char_to_bit4(c: u8) -> u8 {
+    STR_2_BIT4[true as usize][c as usize]
+}
+
 #[cfg(test)]
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
@@ -385,5 +424,45 @@ mod tests {
         ];
         let actual_out = input.map(is_mixedbase);
         assert_eq!(expected_out, actual_out);
+    }
+
+    #[test]
+    fn test_detect_pam_orientation_normal() {
+        let filter = b"NNNNNNNNNNNNNNNNNNNNNNGG";
+        let (reversed, pam_len) = detect_pam_orientation(filter);
+        assert_eq!(reversed, false);
+        assert_eq!(pam_len, 2);
+    }
+
+    #[test]
+    fn test_detect_pam_orientation_reversed() {
+        let filter = b"TTTNNNNNNNNNNNNNNNNNNNNN";
+        let (reversed, pam_len) = detect_pam_orientation(filter);
+        assert_eq!(reversed, true);
+        assert_eq!(pam_len, 3);
+    }
+
+    #[test]
+    fn test_extract_guide_normal() {
+        let pattern = b"ACGTACGTACGTACGTACGTNNN";
+        let guide = extract_guide(pattern, false, 3);
+        assert_eq!(guide, b"ACGTACGTACGTACGTACGT");
+    }
+
+    #[test]
+    fn test_extract_guide_reversed() {
+        let pattern = b"NNNACGTACGTACGTACGTACGT";
+        let guide = extract_guide(pattern, true, 3);
+        assert_eq!(guide, b"ACGTACGTACGTACGTACGT");
+    }
+
+    #[test]
+    fn test_char_to_bit4() {
+        // A=0x4, C=0x2, G=0x8, T=0x1, N=0xF (from STR_2_BIT4)
+        assert_eq!(char_to_bit4(b'A'), 0x4);
+        assert_eq!(char_to_bit4(b'C'), 0x2);
+        assert_eq!(char_to_bit4(b'G'), 0x8);
+        assert_eq!(char_to_bit4(b'T'), 0x1);
+        assert_eq!(char_to_bit4(b'N'), 0xF);
     }
 }

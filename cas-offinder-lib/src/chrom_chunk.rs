@@ -17,10 +17,12 @@ impl ChromChunkInfo {
 }
 pub struct Match {
     pub chr_name: String,
-    pub dna_seq: Vec<u8>,
-    pub rna_seq: Vec<u8>,
+    pub dna_seq: Vec<u8>,   // with '-' for gaps in DNA
+    pub rna_seq: Vec<u8>,   // with '-' for gaps in RNA
     pub chrom_idx: u64,
     pub pattern_idx: u32,
     pub mismatches: u32,
     pub is_forward: bool,
+    pub dna_bulge_size: u32, // number of extra chars in DNA (crRNA shown with '-')
+    pub rna_bulge_size: u32, // number of extra chars in RNA (DNA shown with '-')
 }
