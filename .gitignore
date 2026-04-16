@@ -15,3 +15,12 @@ Cargo.lock
 _test_data
 opencl3
 /docs/superpowers/
+
+# OpenCL loader symlinks used at build time
+/cas-offinder-cli/libOpenCL.so
+/cas-offinder-lib/libOpenCL.so
+
+# Ad-hoc test inputs and outputs kept at repo root
+/output.txt
+/output_*.txt
+/test_run.in
