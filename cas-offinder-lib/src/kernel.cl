@@ -24,6 +24,8 @@ struct s_match
     uint32_t loc;
     uint32_t pattern_idx;
     uint32_t mismatches;
+    uint16_t dna_bulge_size;
+    uint16_t rna_bulge_size;
 };
 typedef struct s_match match;
 
@@ -68,6 +70,8 @@ __kernel void find_matches(__global block_ty* genome,
                     .loc = (genome_idx + o) * BLOCKS_AVAIL + k,
                     .pattern_idx = pattern_block_idx,
                     .mismatches = mismatches,
+                    .dna_bulge_size = 0,
+                    .rna_bulge_size = 0,
                 };
                 match_buffer[next_idx] = next_item;
             }
