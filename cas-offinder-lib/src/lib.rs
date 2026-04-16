@@ -1,6 +1,7 @@
 mod bit4ops;
 mod chrom_chunk;
 mod cli_err;
+mod log_writer;
 mod myers;
 mod read_2bit;
 mod read_fasta;
@@ -12,6 +13,7 @@ mod traceback;
 pub use crate::bit4ops::*;
 pub use crate::chrom_chunk::*;
 pub use crate::cli_err::*;
+pub use crate::log_writer::*;
 pub use crate::myers::*;
 pub use crate::read_2bit::*;
 pub use crate::read_fasta::*;

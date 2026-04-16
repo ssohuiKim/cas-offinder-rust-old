@@ -980,30 +980,27 @@ mod tests {
             }
             count
         });
-        let pattern1 = b"CCGTGGTTCAACATTTGCTTAGCA";
-        let pattern2 = b"GATGTTGGTAAGTGGGATATGGCA";
-        let mut pattern3 = *pattern1;
-        let mut pattern4 = *pattern2;
+        let pattern1 = b"CCGTGGTTCAACATTTGCTTAGCA".to_vec();
+        let pattern2 = b"GATGTTGGTAAGTGGGATATGGCA".to_vec();
+        let mut pattern3 = pattern1.clone();
+        let mut pattern4 = pattern2.clone();
         pattern3.reverse();
         pattern4.reverse();
-        let mut pattern1_bit4 = vec![0_u8; 12];
-        let mut pattern2_bit4 = vec![0_u8; 12];
-        let mut pattern3_bit4 = vec![0_u8; 12];
-        let mut pattern4_bit4 = vec![0_u8; 12];
-        string_to_bit4(&mut pattern1_bit4, pattern1, 0, true);
-        string_to_bit4(&mut pattern2_bit4, pattern2, 0, true);
-        string_to_bit4(&mut pattern3_bit4, &pattern3, 0, true);
-        string_to_bit4(&mut pattern4_bit4, &pattern4, 0, true);
-        let patterns = vec![pattern1_bit4, pattern2_bit4, pattern3_bit4, pattern4_bit4];
+        let patterns_ascii: Vec<Vec<u8>> =
+            vec![pattern1.clone(), pattern2.clone(), pattern3, pattern4];
         let max_mismatches = 11;
         let expected_results_per_file = 117;
         let expected_results = expected_results_per_file * NUM_ITERS;
         let pattern_len = pattern2.len();
+        let search_filter: Vec<u8> = vec![b'N'; pattern_len];
         search(
             OclRunConfig::new(OclDeviceType::CPU).unwrap(),
             max_mismatches,
+            0, // max_dna_bulges
+            0, // max_rna_bulges
+            &search_filter,
             pattern_len,
-            &patterns,
+            &patterns_ascii,
             src_receiver,
             dest_sender,
         );

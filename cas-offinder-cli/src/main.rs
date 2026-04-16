@@ -67,6 +67,26 @@ fn main() {
     ) = mpsc::sync_channel(4);
     let (dest_sender, dest_receiver): (mpsc::SyncSender<Vec<Match>>, mpsc::Receiver<Vec<Match>>) =
         mpsc::sync_channel(4);
+
+    // Capture data needed later (log + result writer) before run_info fields get moved.
+    let out_path_clone = run_info.out_path.clone();
+    let search_filter_clone = run_info.search_filter.clone();
+    let pattern_len_clone = run_info.pattern_len;
+    let use_myers = run_info.max_dna_bulges > 0 || run_info.max_rna_bulges > 0;
+    let log_out_path = run_info.out_path.clone();
+    let log_genome_path = run_info.genome_path.clone();
+    let log_n_patterns = run_info.patterns.len();
+    let log_search_filter = run_info.search_filter.clone();
+    let log_max_mismatches = run_info.max_mismatches;
+    let log_max_dna_bulges = run_info.max_dna_bulges;
+    let log_max_rna_bulges = run_info.max_rna_bulges;
+    let log_device_label = match run_info.dev_ty {
+        OclDeviceType::CPU => "CPU".to_string(),
+        OclDeviceType::GPU => "GPU".to_string(),
+        OclDeviceType::ACCEL => "Accelerator".to_string(),
+        OclDeviceType::ALL => "All".to_string(),
+    };
+
     let send_thread = thread::spawn(move || {
         let genome_path = Path::new(&run_info.genome_path);
         let is_folder = fs::metadata(genome_path).unwrap().is_dir();
@@ -83,10 +103,6 @@ fn main() {
             }
         }
     });
-    let out_path_clone = run_info.out_path.clone();
-    let search_filter_clone = run_info.search_filter.clone();
-    let pattern_len_clone = run_info.pattern_len;
-    let use_myers = run_info.max_dna_bulges > 0 || run_info.max_rna_bulges > 0;
     let result_count = thread::spawn(move || {
         let out_writer = if out_path_clone != "-" {
             Box::new(File::create(out_path_clone).unwrap()) as Box<dyn Write>
@@ -189,7 +205,36 @@ fn main() {
         dest_sender,
     );
     send_thread.join().unwrap();
-    let _total_matches = result_count.join().unwrap();
+    let total_matches = result_count.join().unwrap();
     let tot_time = start_time.elapsed();
     eprintln!("Completed in {}s", tot_time.as_secs_f64());
+
+    // Write .log file alongside the output (skip when writing to stdout).
+    if log_out_path != "-" {
+        let log_path = format!("{}.log", log_out_path);
+        let genome_size = fs::metadata(&log_genome_path).map(|m| m.len()).unwrap_or(0);
+        let algorithm = if use_myers {
+            "Myers bit-parallel".to_string()
+        } else {
+            "popcount (legacy)".to_string()
+        };
+        let log = RunLog {
+            genome_path: log_genome_path,
+            genome_size,
+            n_patterns: log_n_patterns,
+            search_filter: std::str::from_utf8(&log_search_filter)
+                .unwrap_or("")
+                .to_string(),
+            max_mismatches: log_max_mismatches,
+            max_dna_bulges: log_max_dna_bulges,
+            max_rna_bulges: log_max_rna_bulges,
+            device_label: log_device_label,
+            algorithm,
+            n_matches: total_matches,
+            total_elapsed_secs: tot_time.as_secs_f64(),
+        };
+        if let Err(e) = write_log(&log_path, &log) {
+            eprintln!("warning: failed to write log file '{}': {}", log_path, e);
+        }
+    }
 }
