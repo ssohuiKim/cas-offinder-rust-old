@@ -46,7 +46,7 @@ impl OclRunConfig {
         })
     }
     pub fn is_empty(&self) -> bool {
-        self.devices.is_empty()
+        self.devices.iter().all(|(_, devs)| devs.is_empty())
     }
     pub fn get_device_strs(&self) -> Vec<String> {
         if self.is_empty() {
