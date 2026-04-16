@@ -94,68 +94,75 @@ fn main() {
             Box::new(std::io::stdout()) as Box<dyn Write>
         };
         let mut out_buf_writer = BufWriter::new(out_writer);
+
+        // Unified cas-offinder-bulge header (always emit)
+        writeln!(
+            out_buf_writer,
+            "#Bulge type\tcrRNA\tDNA\tChromosome\tPosition\tDirection\tMismatches\tBulge Size"
+        )
+        .unwrap();
+
         let mut search_filter_buf = vec![0_u8; cdiv(pattern_len_clone, 2)];
         string_to_bit4(&mut search_filter_buf, &search_filter_clone, 0, true);
         let mut dna_buf = vec![0_u8; cdiv(pattern_len_clone, 2)];
         let mut marked_dna_buf: Vec<u8> = vec![0_u8; pattern_len_clone];
+        let mut total_matches: u64 = 0;
+
         for chunk in dest_receiver.iter() {
             for m in chunk {
+                let (bulge_type, bulge_size, rna_out, dna_out);
+                let dir = if m.is_forward { '+' } else { '-' };
+
                 if use_myers {
-                    // Myers path: skip post-hoc PAM filter (already applied in search_chunk_myers)
-                    let dir = if m.is_forward { '+' } else { '-' };
-                    let bulge_total = m.dna_bulge_size + m.rna_bulge_size;
-                    let bulge_type = if bulge_total == 0 {
+                    // Myers path: bulge info already classified, PAM already verified.
+                    let total = m.dna_bulge_size + m.rna_bulge_size;
+                    bulge_type = if total == 0 {
                         "X"
                     } else if m.dna_bulge_size > 0 {
                         "DNA"
                     } else {
                         "RNA"
                     };
-                    let rna_str = std::str::from_utf8(&m.rna_seq).unwrap();
-                    let dna_str = std::str::from_utf8(&m.dna_seq).unwrap();
-                    writeln!(
-                        out_buf_writer,
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                        bulge_type,
-                        rna_str,
-                        dna_str,
-                        m.chr_name,
-                        m.chrom_idx,
-                        dir,
-                        m.mismatches,
-                        bulge_total
-                    )
-                    .unwrap();
-                    continue;
-                }
-
-                // Legacy popcount path (bulge=0): existing post-hoc PAM filter
-                dna_buf.fill(0);
-                string_to_bit4(&mut dna_buf, &m.dna_seq, 0, false);
-                let n_search_matches: u32 = dna_buf
-                    .iter()
-                    .zip(search_filter_buf.iter())
-                    .map(|(x1, x2)| (*x1 & *x2).count_ones())
-                    .sum();
-                if n_search_matches as usize == pattern_len_clone {
-                    let dir = if m.is_forward { '+' } else { '-' };
+                    bulge_size = total;
+                    rna_out = m.rna_seq.clone();
+                    dna_out = m.dna_seq.clone();
+                } else {
+                    // Legacy popcount path (bulge=0): apply post-hoc PAM filter,
+                    // mark mismatched DNA bases lowercase (old convention).
+                    dna_buf.fill(0);
+                    string_to_bit4(&mut dna_buf, &m.dna_seq, 0, false);
+                    let n_search_matches: u32 = dna_buf
+                        .iter()
+                        .zip(search_filter_buf.iter())
+                        .map(|(x1, x2)| (*x1 & *x2).count_ones())
+                        .sum();
+                    if n_search_matches as usize != pattern_len_clone {
+                        continue;
+                    }
                     marked_dna_buf.clone_from_slice(&m.dna_seq);
                     for (dnac, rnac) in marked_dna_buf.iter_mut().zip(m.rna_seq.iter()) {
                         if !cmp_chars(*dnac, *rnac) {
                             *dnac |= !0xdf;
                         }
                     }
-                    let rna_str = std::str::from_utf8(&m.rna_seq).unwrap();
-                    let dna_str = std::str::from_utf8(&marked_dna_buf).unwrap();
-                    write!(
-                        out_buf_writer,
-                        "{}\t{}\t{}\t{}\t{}\t{}\r\n",
-                        rna_str, m.chr_name, m.chrom_idx, dna_str, dir, m.mismatches
-                    )
-                    .unwrap();
+                    bulge_type = "X";
+                    bulge_size = 0;
+                    rna_out = m.rna_seq.clone();
+                    dna_out = marked_dna_buf.clone();
                 }
+
+                let rna_str = std::str::from_utf8(&rna_out).unwrap();
+                let dna_str = std::str::from_utf8(&dna_out).unwrap();
+                writeln!(
+                    out_buf_writer,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    bulge_type, rna_str, dna_str, m.chr_name, m.chrom_idx, dir, m.mismatches, bulge_size
+                )
+                .unwrap();
+                total_matches += 1;
             }
         }
+        total_matches
     });
 
     let run_config = match OclRunConfig::new(run_info.dev_ty) {
@@ -182,8 +189,7 @@ fn main() {
         dest_sender,
     );
     send_thread.join().unwrap();
-    result_count.join().unwrap();
+    let _total_matches = result_count.join().unwrap();
     let tot_time = start_time.elapsed();
     eprintln!("Completed in {}s", tot_time.as_secs_f64());
-    // assert_eq!(result_count.join().unwrap(), expected_results);
 }
