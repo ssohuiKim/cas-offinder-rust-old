@@ -83,19 +83,53 @@ fn main() {
             }
         }
     });
+    let out_path_clone = run_info.out_path.clone();
+    let search_filter_clone = run_info.search_filter.clone();
+    let pattern_len_clone = run_info.pattern_len;
+    let use_myers = run_info.max_dna_bulges > 0 || run_info.max_rna_bulges > 0;
     let result_count = thread::spawn(move || {
-        let out_writer = if run_info.out_path != "-" {
-            Box::new(File::create(run_info.out_path).unwrap()) as Box<dyn Write>
+        let out_writer = if out_path_clone != "-" {
+            Box::new(File::create(out_path_clone).unwrap()) as Box<dyn Write>
         } else {
             Box::new(std::io::stdout()) as Box<dyn Write>
         };
         let mut out_buf_writer = BufWriter::new(out_writer);
-        let mut search_filter_buf = vec![0_u8; cdiv(run_info.pattern_len, 2)];
-        string_to_bit4(&mut search_filter_buf, &run_info.search_filter, 0, true);
-        let mut dna_buf = vec![0_u8; cdiv(run_info.pattern_len, 2)];
-        let mut marked_dna_buf: Vec<u8> = vec![0_u8; run_info.pattern_len];
+        let mut search_filter_buf = vec![0_u8; cdiv(pattern_len_clone, 2)];
+        string_to_bit4(&mut search_filter_buf, &search_filter_clone, 0, true);
+        let mut dna_buf = vec![0_u8; cdiv(pattern_len_clone, 2)];
+        let mut marked_dna_buf: Vec<u8> = vec![0_u8; pattern_len_clone];
         for chunk in dest_receiver.iter() {
             for m in chunk {
+                if use_myers {
+                    // Myers path: skip post-hoc PAM filter (already applied in search_chunk_myers)
+                    let dir = if m.is_forward { '+' } else { '-' };
+                    let bulge_total = m.dna_bulge_size + m.rna_bulge_size;
+                    let bulge_type = if bulge_total == 0 {
+                        "X"
+                    } else if m.dna_bulge_size > 0 {
+                        "DNA"
+                    } else {
+                        "RNA"
+                    };
+                    let rna_str = std::str::from_utf8(&m.rna_seq).unwrap();
+                    let dna_str = std::str::from_utf8(&m.dna_seq).unwrap();
+                    writeln!(
+                        out_buf_writer,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        bulge_type,
+                        rna_str,
+                        dna_str,
+                        m.chr_name,
+                        m.chrom_idx,
+                        dir,
+                        m.mismatches,
+                        bulge_total
+                    )
+                    .unwrap();
+                    continue;
+                }
+
+                // Legacy popcount path (bulge=0): existing post-hoc PAM filter
                 dna_buf.fill(0);
                 string_to_bit4(&mut dna_buf, &m.dna_seq, 0, false);
                 let n_search_matches: u32 = dna_buf
@@ -103,7 +137,7 @@ fn main() {
                     .zip(search_filter_buf.iter())
                     .map(|(x1, x2)| (*x1 & *x2).count_ones())
                     .sum();
-                if n_search_matches as usize == run_info.pattern_len {
+                if n_search_matches as usize == pattern_len_clone {
                     let dir = if m.is_forward { '+' } else { '-' };
                     marked_dna_buf.clone_from_slice(&m.dna_seq);
                     for (dnac, rnac) in marked_dna_buf.iter_mut().zip(m.rna_seq.iter()) {
@@ -136,20 +170,14 @@ fn main() {
     let mut all_patterns: Vec<Vec<u8>> = run_info.patterns.clone();
     all_patterns.extend_from_slice(&reversed_byte_patterns);
 
-    let all_patterns_4bit: Vec<Vec<u8>> = all_patterns
-        .iter()
-        .map(|pat| {
-            let mut buf = vec![0_u8; cdiv(pat.len(), 2)];
-            string_to_bit4(&mut buf, pat, 0, true);
-            buf
-        })
-        .collect();
-
     search(
         run_config,
         run_info.max_mismatches,
+        run_info.max_dna_bulges,
+        run_info.max_rna_bulges,
+        &run_info.search_filter,
         run_info.pattern_len,
-        &all_patterns_4bit,
+        &all_patterns,
         src_receiver,
         dest_sender,
     );

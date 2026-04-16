@@ -363,6 +363,362 @@ fn search_compute_cpu(
     }
 }
 
+// ============================================================================
+// Myers bit-parallel CPU path (supports DNA + RNA bulges)
+// ============================================================================
+
+/// Per-match extra alignment info from Myers path, kept parallel to SearchMatch.
+#[derive(Clone, Debug)]
+pub struct MyersAlignment {
+    pub pattern_aligned: Vec<u8>, // pattern bases with '-' for DNA bulge positions
+    pub text_aligned: Vec<u8>,    // text bases with '-' for RNA bulge positions
+}
+
+struct SearchChunkResultMyers {
+    pub matches: Vec<SearchMatch>,
+    pub alignments: Vec<MyersAlignment>,
+    pub meta: SearchChunkMeta,
+    pub data: Box<[u8; SEARCH_CHUNK_SIZE_BYTES]>,
+}
+
+fn nucl_idx_ascii(c: u8) -> u8 {
+    match c.to_ascii_uppercase() {
+        b'A' => 0,
+        b'C' => 1,
+        b'G' => 2,
+        b'T' => 3,
+        _ => 4,
+    }
+}
+
+fn search_chunk_myers(
+    max_mismatches: u32,
+    max_dna_bulges: u32,
+    max_rna_bulges: u32,
+    patterns_ascii: &[Vec<u8>],
+    effective_filters_bit4: &[Vec<u8>],
+    pattern_is_n: &[Vec<bool>],
+    peqs: &[crate::myers::PeqTable],
+    chunk_data_bit4: &[u8; SEARCH_CHUNK_SIZE_BYTES],
+    active_nucl: usize,
+) -> (Vec<SearchMatch>, Vec<MyersAlignment>) {
+    use crate::traceback::{traceback, EditOp};
+
+    let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
+    let total_nucl = active_nucl.min(SEARCH_CHUNK_SIZE_BYTES * 2);
+    let pattern_len = patterns_ascii[0].len();
+    let text_window_len = pattern_len + max_dna_bulges as usize;
+
+    // Decode only the active (non-padding) region to ASCII
+    let mut ascii_chunk = vec![0u8; total_nucl];
+    crate::bit4_to_string(&mut ascii_chunk, chunk_data_bit4, 0, total_nucl);
+
+    let mut matches: Vec<SearchMatch> = Vec::new();
+    let mut alignments: Vec<MyersAlignment> = Vec::new();
+
+    let mask = if pattern_len < 64 {
+        (1u64 << pattern_len) - 1
+    } else {
+        !0u64
+    };
+    let last_bit = 1u64 << (pattern_len - 1);
+
+    for (p_idx, peq) in peqs.iter().enumerate() {
+        let pattern = &patterns_ascii[p_idx];
+        let is_n_pat = &pattern_is_n[p_idx];
+        let eff_filter = &effective_filters_bit4[p_idx];
+
+        // Myers sweep across the chunk
+        let mut vp: u64 = mask;
+        let mut vn: u64 = 0;
+        let mut score: i32 = pattern_len as i32;
+
+        for (t_pos, &c) in ascii_chunk.iter().enumerate() {
+            let idx = nucl_idx_ascii(c);
+            let eq = if idx < 4 {
+                peq.peq[idx as usize]
+            } else {
+                peq.peq[0] | peq.peq[1] | peq.peq[2] | peq.peq[3]
+            };
+            let x = eq | vn;
+            let d0 = (((x & vp).wrapping_add(vp)) ^ vp) | x;
+            let hn = vp & d0;
+            let hp = vn | !(vp | d0);
+            let x_shift = hp << 1;
+            vn = x_shift & d0;
+            vp = (hn << 1) | !(x_shift | d0);
+            vp &= mask;
+            vn &= mask;
+            if hp & last_bit != 0 {
+                score += 1;
+            }
+            if hn & last_bit != 0 {
+                score -= 1;
+            }
+
+            // Only consider matches once we've consumed at least pattern_len chars
+            if t_pos + 1 < pattern_len {
+                continue;
+            }
+            if score < 0 || (score as u32) > max_edits {
+                continue;
+            }
+
+            // Candidate: pattern aligned ending at t_pos (inclusive)
+            let text_start_in_chunk = (t_pos + 1).saturating_sub(text_window_len);
+            let text = &ascii_chunk[text_start_in_chunk..=t_pos];
+
+            let align = match traceback(pattern, text, max_edits) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // Walk ops: classify edits and reject if any edit touches PAM region
+            let mut pattern_pos = 0usize;
+            let mut mismatches: u32 = 0;
+            let mut dna_bulges: u32 = 0;
+            let mut rna_bulges: u32 = 0;
+            let mut valid = true;
+            for op in &align.ops {
+                match op {
+                    EditOp::Match => {
+                        pattern_pos += 1;
+                    }
+                    EditOp::Substitution => {
+                        if is_n_pat[pattern_pos] {
+                            valid = false;
+                            break;
+                        }
+                        mismatches += 1;
+                        pattern_pos += 1;
+                    }
+                    EditOp::RnaBulge => {
+                        if is_n_pat[pattern_pos] {
+                            valid = false;
+                            break;
+                        }
+                        rna_bulges += 1;
+                        pattern_pos += 1;
+                    }
+                    EditOp::DnaBulge => {
+                        let prev_n = pattern_pos > 0 && is_n_pat[pattern_pos - 1];
+                        let next_n = pattern_pos < pattern_len && is_n_pat[pattern_pos];
+                        if prev_n || next_n {
+                            valid = false;
+                            break;
+                        }
+                        dna_bulges += 1;
+                    }
+                }
+            }
+            if !valid {
+                continue;
+            }
+            if mismatches > max_mismatches
+                || dna_bulges > max_dna_bulges
+                || rna_bulges > max_rna_bulges
+            {
+                continue;
+            }
+
+            // PAM check: for each pattern position that maps to a genome base,
+            // verify (genome_bit4 & effective_filter_bit4[p]) != 0.
+            // N positions in filter pass trivially (0xF).
+            let mut pam_ok = true;
+            let mut p_in_pat = 0usize;
+            let mut g_off = 0usize;
+            for op in &align.ops {
+                match op {
+                    EditOp::Match | EditOp::Substitution => {
+                        let genome_c = text[g_off];
+                        let g_bit4 = crate::bit4ops::char_to_bit4(genome_c);
+                        let f_bit4 = eff_filter[p_in_pat];
+                        if (g_bit4 & f_bit4) == 0 {
+                            pam_ok = false;
+                            break;
+                        }
+                        p_in_pat += 1;
+                        g_off += 1;
+                    }
+                    EditOp::DnaBulge => {
+                        g_off += 1;
+                    }
+                    EditOp::RnaBulge => {
+                        p_in_pat += 1;
+                    }
+                }
+            }
+            if !pam_ok {
+                continue;
+            }
+
+            // Compute genome span and match start
+            let genome_span: usize = align.text_aligned.iter().filter(|&&c| c != b'-').count();
+            let match_start = t_pos + 1 - genome_span;
+
+            matches.push(SearchMatch {
+                chunk_idx: match_start as u32,
+                pattern_idx: p_idx as u32,
+                mismatches,
+                dna_bulge_size: dna_bulges as u16,
+                rna_bulge_size: rna_bulges as u16,
+            });
+            alignments.push(MyersAlignment {
+                pattern_aligned: align.pattern_aligned.clone(),
+                text_aligned: align.text_aligned.clone(),
+            });
+        }
+    }
+    (matches, alignments)
+}
+
+fn search_device_cpu_thread_myers(
+    max_mismatches: u32,
+    max_dna_bulges: u32,
+    max_rna_bulges: u32,
+    patterns_ascii: Arc<Vec<Vec<u8>>>,
+    effective_filters_bit4: Arc<Vec<Vec<u8>>>,
+    pattern_is_n: Arc<Vec<Vec<bool>>>,
+    peqs: Arc<Vec<crate::myers::PeqTable>>,
+    recv: crossbeam_channel::Receiver<SearchChunkInfo>,
+    dest: mpsc::SyncSender<SearchChunkResultMyers>,
+) {
+    for schunk in recv.iter() {
+        // Determine active (non-padding) region: n_chunks * CHUNK_SIZE nucleotides
+        let n_chunks = schunk.meta.chr_names.len();
+        let active_nucl = n_chunks * CHUNK_SIZE;
+        let (matches, alignments) = search_chunk_myers(
+            max_mismatches,
+            max_dna_bulges,
+            max_rna_bulges,
+            &patterns_ascii,
+            &effective_filters_bit4,
+            &pattern_is_n,
+            &peqs,
+            &schunk.data,
+            active_nucl,
+        );
+        dest.send(SearchChunkResultMyers {
+            matches,
+            alignments,
+            meta: schunk.meta,
+            data: schunk.data,
+        })
+        .unwrap();
+    }
+}
+
+fn search_compute_cpu_myers(
+    max_mismatches: u32,
+    max_dna_bulges: u32,
+    max_rna_bulges: u32,
+    search_filter_ascii: &[u8],
+    patterns_ascii: &[Vec<u8>],
+    n_original_patterns: usize,
+    recv: crossbeam_channel::Receiver<SearchChunkInfo>,
+    dest: mpsc::SyncSender<SearchChunkResultMyers>,
+) {
+    use crate::bit4ops::{char_to_bit4, reverse_compliment_char};
+    use crate::myers::build_peq;
+
+    // Precompute shared per-pattern tables
+    let peqs: Vec<crate::myers::PeqTable> =
+        patterns_ascii.iter().map(|p| build_peq(p)).collect();
+    let pattern_is_n: Vec<Vec<bool>> = patterns_ascii
+        .iter()
+        .map(|p| p.iter().map(|&c| c == b'N' || c == b'n').collect())
+        .collect();
+    let filter_revcomp = reverse_compliment_char(search_filter_ascii);
+    let effective_filters_bit4: Vec<Vec<u8>> = patterns_ascii
+        .iter()
+        .enumerate()
+        .map(|(p_idx, _)| {
+            let f_ascii: &[u8] = if p_idx < n_original_patterns {
+                search_filter_ascii
+            } else {
+                &filter_revcomp
+            };
+            f_ascii.iter().map(|&c| char_to_bit4(c)).collect()
+        })
+        .collect();
+
+    let peqs_arc = Arc::new(peqs);
+    let is_n_arc = Arc::new(pattern_is_n);
+    let filters_arc = Arc::new(effective_filters_bit4);
+    let patterns_arc = Arc::new(patterns_ascii.to_vec());
+
+    let n_threads: usize = thread::available_parallelism().unwrap().into();
+    let mut threads: Vec<thread::JoinHandle<()>> = Vec::new();
+    for _ in 0..n_threads {
+        let t_pat = patterns_arc.clone();
+        let t_filt = filters_arc.clone();
+        let t_isn = is_n_arc.clone();
+        let t_peqs = peqs_arc.clone();
+        let t_recv = recv.clone();
+        let t_dest = dest.clone();
+        threads.push(thread::spawn(move || {
+            search_device_cpu_thread_myers(
+                max_mismatches,
+                max_dna_bulges,
+                max_rna_bulges,
+                t_pat,
+                t_filt,
+                t_isn,
+                t_peqs,
+                t_recv,
+                t_dest,
+            )
+        }));
+    }
+    for t in threads {
+        t.join().unwrap();
+    }
+}
+
+fn convert_matches_myers(
+    patterns_ascii: &[Vec<u8>],
+    pattern_len: usize,
+    search_res: SearchChunkResultMyers,
+) -> Vec<Match> {
+    let n_orig = patterns_ascii.len() / 2;
+    let mut results: Vec<Match> = Vec::new();
+    for (smatch, align) in search_res.matches.iter().zip(search_res.alignments.iter()) {
+        let chunk_pos = smatch.chunk_idx as usize;
+        let idx = chunk_pos / CHUNK_SIZE;
+        let offset = chunk_pos % CHUNK_SIZE;
+        let pos = search_res.meta.chunk_starts[idx] + offset as u64;
+        let is_last_chunk = idx == CHUNKS_PER_SEARCH - 1;
+        let is_end_chrom = idx == search_res.meta.chr_names.len() - 1
+            || search_res.meta.chunk_starts[idx + 1] == 0;
+        let is_past_end = pos + pattern_len as u64 > search_res.meta.chunk_ends[idx];
+        if is_last_chunk || (is_end_chrom && is_past_end) {
+            continue;
+        }
+
+        let is_forward = (smatch.pattern_idx as usize) < n_orig;
+        // dna_seq / rna_seq are the aligned strings (with '-' gaps)
+        let mut dna_result = align.text_aligned.clone();
+        let mut rna_result = align.pattern_aligned.clone();
+        if !is_forward {
+            reverse_compliment_char_i(&mut dna_result);
+            reverse_compliment_char_i(&mut rna_result);
+        }
+
+        results.push(Match {
+            chr_name: search_res.meta.chr_names[idx].clone(),
+            chrom_idx: pos,
+            pattern_idx: smatch.pattern_idx,
+            mismatches: smatch.mismatches,
+            is_forward,
+            dna_seq: dna_result,
+            rna_seq: rna_result,
+            dna_bulge_size: smatch.dna_bulge_size as u32,
+            rna_bulge_size: smatch.rna_bulge_size as u32,
+        });
+    }
+    results
+}
+
 fn chunks_to_searchchunk(chunk_buf: &[ChromChunkInfo]) -> SearchChunkInfo {
     let mut search_buf = Box::new([0_u8; SEARCH_CHUNK_SIZE_BYTES]);
     let mut names: Vec<String> = Vec::with_capacity(CHUNKS_PER_SEARCH);
@@ -447,26 +803,39 @@ fn convert_matches(
 pub fn search(
     devices: OclRunConfig,
     max_mismatches: u32,
+    max_dna_bulges: u32,
+    max_rna_bulges: u32,
+    search_filter_ascii: &[u8],
     pattern_len: usize,
-    patterns: &Vec<Vec<u8>>,
+    patterns_ascii: &Vec<Vec<u8>>,
     recv: mpsc::Receiver<ChromChunkInfo>,
     dest: mpsc::SyncSender<Vec<Match>>,
 ) {
     /* public facing function, sends and receives data chunk by chunk */
-    assert!(!patterns.is_empty());
-    assert!(patterns[0].len() * 2 >= pattern_len);
+    assert!(!patterns_ascii.is_empty());
+    assert!(
+        patterns_ascii.iter().all(|p| p.len() == patterns_ascii[0].len()),
+        "All patterns must have same length"
+    );
+    assert!(patterns_ascii[0].len() == pattern_len);
+
+    let use_myers = max_dna_bulges > 0 || max_rna_bulges > 0;
+
+    // Convert patterns to bit4 for GPU / legacy CPU path
+    let patterns_bit4: Vec<Vec<u8>> = patterns_ascii
+        .iter()
+        .map(|pat| {
+            let mut buf = vec![0_u8; cdiv(pat.len(), 2)];
+            crate::string_to_bit4(&mut buf, pat, 0, true);
+            buf
+        })
+        .collect();
+
     let (compute_send_src, compute_recv_src): (
         crossbeam_channel::Sender<SearchChunkInfo>,
         crossbeam_channel::Receiver<SearchChunkInfo>,
     ) = crossbeam_channel::bounded(4);
-    let (compute_send_dest, compute_recv_dest): (
-        mpsc::SyncSender<SearchChunkResult>,
-        mpsc::Receiver<SearchChunkResult>,
-    ) = mpsc::sync_channel(4);
-    assert!(
-        patterns.iter().all(|p| p.len() == patterns[0].len()),
-        "All patterns must have same length"
-    );
+
     let send_thread = thread::Builder::new()
         .stack_size(SEARCH_CHUNK_SIZE_BYTES * 2)
         .spawn(move || {
@@ -494,38 +863,76 @@ pub fn search(
             }
         })
         .unwrap();
-    let patern_clone = patterns.clone();
-    let recv_thread = thread::spawn(move || {
-        for search_chunk in compute_recv_dest.iter() {
-            dest.send(convert_matches(pattern_len, &patern_clone, search_chunk))
+
+    if use_myers {
+        // Myers CPU path (GPU Myers kernel coming in Phase 8)
+        let (compute_send_dest, compute_recv_dest): (
+            mpsc::SyncSender<SearchChunkResultMyers>,
+            mpsc::Receiver<SearchChunkResultMyers>,
+        ) = mpsc::sync_channel(4);
+        let patterns_ascii_clone = patterns_ascii.clone();
+        let n_original = patterns_ascii.len() / 2;
+        let recv_thread = thread::spawn(move || {
+            for search_chunk in compute_recv_dest.iter() {
+                dest.send(convert_matches_myers(
+                    &patterns_ascii_clone,
+                    pattern_len,
+                    search_chunk,
+                ))
                 .unwrap();
-        }
-    });
-    if devices.is_empty() {
-        search_compute_cpu(
+            }
+        });
+        search_compute_cpu_myers(
             max_mismatches,
-            pattern_len,
-            patterns,
+            max_dna_bulges,
+            max_rna_bulges,
+            search_filter_ascii,
+            patterns_ascii,
+            n_original,
             compute_recv_src,
             compute_send_dest,
         );
+        send_thread.join().unwrap();
+        recv_thread.join().unwrap();
     } else {
-        match search_chunk_ocl(
-            devices,
-            max_mismatches,
-            pattern_len,
-            patterns,
-            compute_recv_src,
-            compute_send_dest,
-        ) {
-            Ok(_) => {}
-            Err(err_int) => {
-                panic!("{}", err_int.to_string())
+        // Legacy popcount path (unchanged behavior for bulge=0)
+        let (compute_send_dest, compute_recv_dest): (
+            mpsc::SyncSender<SearchChunkResult>,
+            mpsc::Receiver<SearchChunkResult>,
+        ) = mpsc::sync_channel(4);
+        let patern_clone = patterns_bit4.clone();
+        let recv_thread = thread::spawn(move || {
+            for search_chunk in compute_recv_dest.iter() {
+                dest.send(convert_matches(pattern_len, &patern_clone, search_chunk))
+                    .unwrap();
             }
-        };
+        });
+        if devices.is_empty() {
+            search_compute_cpu(
+                max_mismatches,
+                pattern_len,
+                &patterns_bit4,
+                compute_recv_src,
+                compute_send_dest,
+            );
+        } else {
+            match search_chunk_ocl(
+                devices,
+                max_mismatches,
+                pattern_len,
+                &patterns_bit4,
+                compute_recv_src,
+                compute_send_dest,
+            ) {
+                Ok(_) => {}
+                Err(err_int) => {
+                    panic!("{}", err_int.to_string())
+                }
+            };
+        }
+        send_thread.join().unwrap();
+        recv_thread.join().unwrap();
     }
-    send_thread.join().unwrap();
-    recv_thread.join().unwrap();
 }
 
 #[cfg(test)]
