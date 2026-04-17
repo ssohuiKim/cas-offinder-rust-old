@@ -24,3 +24,10 @@ opencl3
 /output.txt
 /output_*.txt
 /test_run.in
+/test/*
+/output/*
+
+/GRCh38.primary_assembly.genome.fa
+/GRCh38.primary_assembly.genome.fa.gz
+/test_*
+/time_*

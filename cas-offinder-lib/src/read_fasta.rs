@@ -23,8 +23,8 @@ pub fn read_fasta(dest: &SyncSender<ChromChunkInfo>, fname: &Path) -> Result<(),
             let next_chr_name = String::from_iter(line.chars().skip(1));
             let next_cur = ChromChunkInfo {
                 chr_name: next_chr_name,
-                chunk_start: cur.chunk_end,
-                chunk_end: cur.chunk_end,
+                chunk_start: 0,
+                chunk_end: 0,
                 data: Box::new([0_u8; CHUNK_SIZE_BYTES]),
             };
             if cur.chunk_end != cur.chunk_start {

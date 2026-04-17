@@ -45,15 +45,27 @@ __kernel void find_matches_myers(
     if (j + 1 < PATTERN_LEN) return;
 
     // ---- PAM pre-check (cheap: ~PAM_LEN × 2 ops) ----
-    uint align_start = j + 1 - PATTERN_LEN;
+    // DNA bulges shift the alignment start leftward; for PAM-first patterns
+    // (pam_off == 0) the PAM position depends on the candidate's bulge count,
+    // so we try each possible shift in [0, MAX_DNA_BULGES]. For PAM-last
+    // patterns the PAM is anchored to j and unaffected by bulges.
     uint pam_off = (uint)pam_offsets[p];
-    for (uint k = 0; k < PAM_LEN; k++) {
-        uint gpos = align_start + pam_off + k;
-        if (gpos >= total_nucl) return;
-        uchar g = get_bit4(genome_bit4, gpos);
-        uchar f = pam_filters_bit4[p * PAM_LEN + k];
-        if ((g & f) == 0) return;   // PAM mismatch → skip this position
+    uint pam_shift_range = (pam_off == 0) ? (MAX_DNA_BULGES + 1u) : 1u;
+    bool pam_ok = false;
+    for (uint b = 0; b < pam_shift_range; b++) {
+        if (j + 1 < PATTERN_LEN + b) continue;
+        uint align_start = j + 1 - PATTERN_LEN - b;
+        bool this_ok = true;
+        for (uint k = 0; k < PAM_LEN; k++) {
+            uint gpos = align_start + pam_off + k;
+            if (gpos >= total_nucl) { this_ok = false; break; }
+            uchar g = get_bit4(genome_bit4, gpos);
+            uchar f = pam_filters_bit4[p * PAM_LEN + k];
+            if ((g & f) == 0) { this_ok = false; break; }
+        }
+        if (this_ok) { pam_ok = true; break; }
     }
+    if (!pam_ok) return;
 
     // ---- Myers bit-parallel (only reached ~1/16 of the time) ----
     ulong peq_a = peq_tables[p * 4 + 0];

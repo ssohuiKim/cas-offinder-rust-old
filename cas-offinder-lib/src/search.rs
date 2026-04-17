@@ -419,7 +419,7 @@ fn classify_myers_candidate(
     let text_start_in_chunk = (end_pos + 1).saturating_sub(text_window_len);
     let text = &ascii_chunk[text_start_in_chunk..=end_pos];
 
-    let align = traceback(pattern, text, max_edits)?;
+    let align = traceback(pattern, text, max_edits, max_dna_bulges, max_rna_bulges)?;
 
     // Walk ops: classify edits and reject if any edit touches PAM region
     let mut pattern_pos = 0usize;
@@ -514,25 +514,48 @@ fn classify_myers_candidate(
 /// Assumes no bulge in PAM region (which we enforce anyway).
 /// `pam_offset`: distance from alignment start to PAM start in pattern
 /// `pam_filter`: bit4 filter values for the PAM positions only (length = pam_len)
+///
+/// DNA bulges shift the alignment start leftward. For PAM-first patterns
+/// (pam_offset == 0), PAM position depends on the actual bulge count in this
+/// candidate, which we don't know yet. So we try each possible bulge count in
+/// [0, max_dna_bulges] and accept if any shift yields a valid PAM.
+/// For PAM-last patterns, PAM is anchored to end_pos and unaffected by bulges.
 fn check_pam_quick(
     ascii_chunk: &[u8],
     end_pos: usize,
     pattern_len: usize,
     pam_offset: usize,
     pam_filter: &[u8],
+    max_dna_bulges: u32,
 ) -> bool {
-    let align_start = (end_pos + 1).saturating_sub(pattern_len);
-    for (k, &f) in pam_filter.iter().enumerate() {
-        let gpos = align_start + pam_offset + k;
-        if gpos >= ascii_chunk.len() {
-            return false;
+    let shift_range: usize = if pam_offset == 0 {
+        max_dna_bulges as usize + 1
+    } else {
+        1
+    };
+    for b in 0..shift_range {
+        let align_start = match (end_pos + 1).checked_sub(pattern_len + b) {
+            Some(x) => x,
+            None => continue,
+        };
+        let mut ok = true;
+        for (k, &f) in pam_filter.iter().enumerate() {
+            let gpos = align_start + pam_offset + k;
+            if gpos >= ascii_chunk.len() {
+                ok = false;
+                break;
+            }
+            let g = crate::bit4ops::char_to_bit4(ascii_chunk[gpos]);
+            if (g & f) == 0 {
+                ok = false;
+                break;
+            }
         }
-        let g = crate::bit4ops::char_to_bit4(ascii_chunk[gpos]);
-        if (g & f) == 0 {
-            return false;
+        if ok {
+            return true;
         }
     }
-    true
+    false
 }
 
 /// Precompute per-pattern PAM pre-check data:
@@ -627,7 +650,7 @@ fn search_chunk_myers(
             }
 
             // PAM pre-check: skip expensive traceback if PAM doesn't match
-            if !check_pam_quick(&ascii_chunk, t_pos, pattern_len, pam_offset, pam_filter) {
+            if !check_pam_quick(&ascii_chunk, t_pos, pattern_len, pam_offset, pam_filter, max_dna_bulges) {
                 continue;
             }
 
@@ -986,10 +1009,11 @@ fn search_chunk_ocl_myers(
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
     let text_window = pattern_len + max_dna_bulges as usize;
     let compile_defs = format!(
-        " -DPATTERN_LEN={} -DPAM_LEN={} -DMAX_EDITS={} -DTEXT_WINDOW={} -DOUT_BUF_SIZE={}",
+        " -DPATTERN_LEN={} -DPAM_LEN={} -DMAX_EDITS={} -DMAX_DNA_BULGES={} -DTEXT_WINDOW={} -DOUT_BUF_SIZE={}",
         pattern_len,
         pam_len,
         max_edits,
+        max_dna_bulges,
         text_window,
         1u32 << 22,
     );

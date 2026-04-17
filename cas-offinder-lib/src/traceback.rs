@@ -31,20 +31,39 @@ fn cmp_loose(pc: u8, tc: u8) -> bool {
 /// Reconstruct the best alignment of `pattern` ending at text position `text.len()`.
 /// Semi-global: pattern must be fully matched; text start is free.
 /// Returns None if no alignment found with edit distance <= max_edits.
-pub fn traceback(pattern: &[u8], text: &[u8], max_edits: u32) -> Option<Alignment> {
+///
+/// `max_dna_bulges` / `max_rna_bulges`: per-type bulge caps. When a cap is 0,
+/// that bulge type is forbidden entirely in the DP (its transition cost = +∞);
+/// this prevents the optimum from landing on an alignment that uses the
+/// disallowed bulge type and then gets rejected by the classify step, which
+/// would cause us to miss the valid alignment that uses only allowed bulges.
+pub fn traceback(
+    pattern: &[u8],
+    text: &[u8],
+    max_edits: u32,
+    max_dna_bulges: u32,
+    max_rna_bulges: u32,
+) -> Option<Alignment> {
     let m = pattern.len();
     let n = text.len();
 
+    const INF: u32 = u32::MAX / 2;
+    let dna_cost: u32 = if max_dna_bulges == 0 { INF } else { 1 };
+    let rna_cost: u32 = if max_rna_bulges == 0 { INF } else { 1 };
+
     let mut dp = vec![vec![0u32; n + 1]; m + 1];
-    for i in 0..=m { dp[i][0] = i as u32; }
+    for i in 0..=m { dp[i][0] = (i as u32).saturating_mul(rna_cost).min(INF); }
     // dp[0][j] = 0 (semi-global)
 
     for i in 1..=m {
         for j in 1..=n {
             let match_cost = if cmp_loose(pattern[i-1], text[j-1]) { 0 } else { 1 };
             dp[i][j] = std::cmp::min(
-                dp[i-1][j-1] + match_cost,
-                std::cmp::min(dp[i-1][j] + 1, dp[i][j-1] + 1),
+                dp[i-1][j-1].saturating_add(match_cost),
+                std::cmp::min(
+                    dp[i-1][j].saturating_add(rna_cost),
+                    dp[i][j-1].saturating_add(dna_cost),
+                ),
             );
         }
     }
@@ -65,7 +84,7 @@ pub fn traceback(pattern: &[u8], text: &[u8], max_edits: u32) -> Option<Alignmen
     while i > 0 || j > 0 {
         if i > 0 && j > 0 {
             let match_cost = if cmp_loose(pattern[i-1], text[j-1]) { 0 } else { 1 };
-            if dp[i][j] == dp[i-1][j-1] + match_cost {
+            if dp[i][j] == dp[i-1][j-1].saturating_add(match_cost) {
                 // Match or substitution
                 if match_cost == 0 {
                     ops.push(EditOp::Match);
@@ -78,7 +97,7 @@ pub fn traceback(pattern: &[u8], text: &[u8], max_edits: u32) -> Option<Alignmen
                 i -= 1; j -= 1;
                 continue;
             }
-            if dp[i][j] == dp[i-1][j] + 1 {
+            if dp[i][j] == dp[i-1][j].saturating_add(rna_cost) {
                 // Deletion: pattern has extra character (RNA bulge)
                 ops.push(EditOp::RnaBulge);
                 rna_bulges += 1;
@@ -87,7 +106,7 @@ pub fn traceback(pattern: &[u8], text: &[u8], max_edits: u32) -> Option<Alignmen
                 i -= 1;
                 continue;
             }
-            if dp[i][j] == dp[i][j-1] + 1 {
+            if dp[i][j] == dp[i][j-1].saturating_add(dna_cost) {
                 // Insertion: text has extra character (DNA bulge)
                 ops.push(EditOp::DnaBulge);
                 dna_bulges += 1;
@@ -97,7 +116,7 @@ pub fn traceback(pattern: &[u8], text: &[u8], max_edits: u32) -> Option<Alignmen
                 continue;
             }
         }
-        if i > 0 && (j == 0 || dp[i][j] == dp[i-1][j] + 1) {
+        if i > 0 && (j == 0 || dp[i][j] == dp[i-1][j].saturating_add(rna_cost)) {
             ops.push(EditOp::RnaBulge);
             rna_bulges += 1;
             pa.push(pattern[i-1]);
@@ -134,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_traceback_exact() {
-        let a = traceback(b"ACGT", b"ACGT", 2).unwrap();
+        let a = traceback(b"ACGT", b"ACGT", 2, 2, 2).unwrap();
         assert_eq!(a.mismatches, 0);
         assert_eq!(a.dna_bulges, 0);
         assert_eq!(a.rna_bulges, 0);
@@ -144,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_traceback_substitution() {
-        let a = traceback(b"ACGT", b"AAGT", 2).unwrap();
+        let a = traceback(b"ACGT", b"AAGT", 2, 2, 2).unwrap();
         assert_eq!(a.mismatches, 1);
         assert_eq!(a.dna_bulges, 0);
         assert_eq!(a.rna_bulges, 0);
@@ -153,7 +172,7 @@ mod tests {
     #[test]
     fn test_traceback_dna_bulge() {
         // text has extra X: "ACGT" vs "ACXGT"
-        let a = traceback(b"ACGT", b"ACXGT", 2).unwrap();
+        let a = traceback(b"ACGT", b"ACXGT", 2, 2, 2).unwrap();
         assert_eq!(a.dna_bulges, 1);
         assert_eq!(a.mismatches, 0);
         assert_eq!(a.rna_bulges, 0);
@@ -164,7 +183,7 @@ mod tests {
     #[test]
     fn test_traceback_rna_bulge() {
         // pattern has extra char: "ACGT" vs "ACT" (G deleted from text)
-        let a = traceback(b"ACGT", b"ACT", 2).unwrap();
+        let a = traceback(b"ACGT", b"ACT", 2, 2, 2).unwrap();
         assert_eq!(a.rna_bulges, 1);
         assert_eq!(a.mismatches, 0);
         assert_eq!(a.dna_bulges, 0);
@@ -174,7 +193,15 @@ mod tests {
 
     #[test]
     fn test_traceback_exceeds_max() {
-        let result = traceback(b"ACGT", b"TTTT", 1);
+        let result = traceback(b"ACGT", b"TTTT", 1, 2, 2);
         assert!(result.is_none(), "Should not find alignment with 1 edit");
+    }
+
+    #[test]
+    fn test_traceback_forbids_rna_when_cap_zero() {
+        // Pattern longer than text forces RNA bulges in semi-global DP (text
+        // end is fixed). With max_rna_bulges = 0, traceback must return None.
+        let r = traceback(b"ACGTA", b"ACT", 3, 2, 0);
+        assert!(r.is_none(), "must not use RNA bulges when forbidden");
     }
 }

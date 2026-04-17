@@ -73,6 +73,21 @@ fn main() {
     let search_filter_clone = run_info.search_filter.clone();
     let pattern_len_clone = run_info.pattern_len;
     let use_myers = run_info.max_dna_bulges > 0 || run_info.max_rna_bulges > 0;
+    // PAM length = positions where the user's crRNA patterns hold N placeholders
+    // (PAM is always at the end in the original crRNA orientation). Counted from
+    // trailing N's of the first pattern; all patterns are padded identically.
+    let pam_len_clone: u64 = {
+        let first = &run_info.patterns[0];
+        let mut count = 0u64;
+        for &c in first.iter().rev() {
+            if c == b'N' || c == b'n' {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    };
     let log_out_path = run_info.out_path.clone();
     let log_genome_path = run_info.genome_path.clone();
     let log_n_patterns = run_info.patterns.len();
@@ -169,10 +184,21 @@ fn main() {
 
                 let rna_str = std::str::from_utf8(&rna_out).unwrap();
                 let dna_str = std::str::from_utf8(&dna_out).unwrap();
+                // Match original cas-offinder position convention:
+                //   + strand: leftmost + strand coord (= Rust internal)
+                //   - strand: shifted by (PAM_len - 1 - dna_bulge_size)
+                let pos_out = if m.is_forward {
+                    m.chrom_idx
+                } else {
+                    m.chrom_idx
+                        + pam_len_clone
+                            .saturating_sub(1)
+                            .saturating_sub(m.dna_bulge_size as u64)
+                };
                 writeln!(
                     out_buf_writer,
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    bulge_type, rna_str, dna_str, m.chr_name, m.chrom_idx, dir, m.mismatches, bulge_size
+                    bulge_type, rna_str, dna_str, m.chr_name, pos_out, dir, m.mismatches, bulge_size
                 )
                 .unwrap();
                 total_matches += 1;
