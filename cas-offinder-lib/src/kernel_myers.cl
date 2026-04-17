@@ -1,23 +1,22 @@
-// Myers bit-parallel edit distance kernel.
-// Each work item computes the edit distance between one pattern (indexed by
-// get_global_id(1)) and the genome window ending at position get_global_id(0).
-// Patterns up to 64 nucleotides fit in a single u64 Peq bit-vector.
+// Myers bit-parallel edit distance kernel with PAM pre-filter.
+//
+// Each work item first checks whether the PAM (e.g. NGG) is present at the
+// expected genome position. If not, it returns immediately (~2 ops). Only
+// positions that pass the PAM check run the full Myers sweep (~pattern_len × 7
+// bit-ops). Since PAM occurs at roughly 1/16 of positions, this eliminates
+// ~94% of work.
 //
 // Compile-time defines required:
-//   PATTERN_LEN   - length of pattern in nucleotides (<= 64)
-//   MAX_EDITS     - maximum edit distance to report (runtime filter)
-//   TEXT_WINDOW   - number of genome chars consumed per work item
-//                   (usually PATTERN_LEN + max_dna_bulges)
+//   PATTERN_LEN   - full pattern length including PAM mask (e.g. 27)
+//   PAM_LEN       - length of PAM region (e.g. 3 for NGG)
+//   MAX_EDITS     - maximum edit distance to report
+//   TEXT_WINDOW   - genome chars consumed per work item (PATTERN_LEN + max_dna_bulges)
 //   OUT_BUF_SIZE  - capacity of the output match buffer
-//
-// Genome is passed as 4-bit packed nucleotides (two per byte), matching the
-// CPU encoding. Ambiguous bases (N, bit-4 value 0xF) match every pattern
-// position; zero bytes (padding beyond active region) match nothing.
 
 struct s_match {
-    uint chunk_idx;     // end position (exclusive) of alignment in chunk
-    uint pattern_idx;   // pattern index
-    uint mismatches;    // edit distance (may include bulges, CPU reclassifies)
+    uint chunk_idx;
+    uint pattern_idx;
+    uint mismatches;
     ushort dna_bulge_size;
     ushort rna_bulge_size;
 };
@@ -29,20 +28,34 @@ static inline uchar get_bit4(__global const uchar* chunk, uint i) {
 
 __kernel void find_matches_myers(
     __global const uchar* genome_bit4,
-    __global const ulong* peq_tables,    // 4 u64s per pattern
+    __global const ulong* peq_tables,       // 4 u64s per pattern
+    __global const uchar* pam_offsets,       // per-pattern: offset from align_start to PAM start
+    __global const uchar* pam_filters_bit4,  // per-pattern: PAM_LEN bytes of bit4 filter
     uint n_patterns,
+    uint n_fwd_patterns,
     uint total_nucl,
     __global struct s_match* out_matches,
     __global uint* out_count
 ) {
-    uint j = get_global_id(0);   // alignment end position (exclusive) - 1
+    uint j = get_global_id(0);   // alignment end position (inclusive)
     uint p = get_global_id(1);   // pattern index
 
     if (p >= n_patterns) return;
     if (j >= total_nucl) return;
     if (j + 1 < PATTERN_LEN) return;
 
-    // Load Peq for this pattern
+    // ---- PAM pre-check (cheap: ~PAM_LEN × 2 ops) ----
+    uint align_start = j + 1 - PATTERN_LEN;
+    uint pam_off = (uint)pam_offsets[p];
+    for (uint k = 0; k < PAM_LEN; k++) {
+        uint gpos = align_start + pam_off + k;
+        if (gpos >= total_nucl) return;
+        uchar g = get_bit4(genome_bit4, gpos);
+        uchar f = pam_filters_bit4[p * PAM_LEN + k];
+        if ((g & f) == 0) return;   // PAM mismatch → skip this position
+    }
+
+    // ---- Myers bit-parallel (only reached ~1/16 of the time) ----
     ulong peq_a = peq_tables[p * 4 + 0];
     ulong peq_c = peq_tables[p * 4 + 1];
     ulong peq_g = peq_tables[p * 4 + 2];
@@ -54,14 +67,12 @@ __kernel void find_matches_myers(
     ulong vn = 0;
     int score = PATTERN_LEN;
 
-    // Text window ending at (and including) position j.
     uint window_len = TEXT_WINDOW;
     uint text_start = (j + 1 > window_len) ? (j + 1 - window_len) : 0;
 
     for (uint t = text_start; t <= j; t++) {
         uchar b4 = get_bit4(genome_bit4, t);
         ulong eq = 0;
-        // bit4 encoding: A=0x4, C=0x2, G=0x8, T=0x1. b4==0 means padding (no match).
         if (b4 & 0x4) eq |= peq_a;
         if (b4 & 0x2) eq |= peq_c;
         if (b4 & 0x8) eq |= peq_g;

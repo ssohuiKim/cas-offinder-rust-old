@@ -462,10 +462,15 @@ fn classify_myers_candidate(
         return None;
     }
 
+    // Compute genome span (non-gap chars in text alignment) and alignment offset
+    let genome_span: usize = align.text_aligned.iter().filter(|&&c| c != b'-').count();
+    // Semi-global: alignment covers text[text.len()-genome_span .. text.len()]
+    let align_text_offset = text.len() - genome_span;
+
     // PAM check: for each pattern position that maps to a genome base,
     // verify (genome_bit4 & effective_filter_bit4[p]) != 0.
     let mut p_in_pat = 0usize;
-    let mut g_off = 0usize;
+    let mut g_off = align_text_offset;
     for op in &align.ops {
         match op {
             EditOp::Match | EditOp::Substitution => {
@@ -487,8 +492,6 @@ fn classify_myers_candidate(
         }
     }
 
-    // Compute genome span and match start
-    let genome_span: usize = align.text_aligned.iter().filter(|&&c| c != b'-').count();
     let match_start = end_pos + 1 - genome_span;
 
     Some((
@@ -506,6 +509,54 @@ fn classify_myers_candidate(
     ))
 }
 
+/// Quick PAM pre-check: given an alignment ending at `end_pos` (inclusive),
+/// verify that the PAM positions in the genome match the expected filter.
+/// Assumes no bulge in PAM region (which we enforce anyway).
+/// `pam_offset`: distance from alignment start to PAM start in pattern
+/// `pam_filter`: bit4 filter values for the PAM positions only (length = pam_len)
+fn check_pam_quick(
+    ascii_chunk: &[u8],
+    end_pos: usize,
+    pattern_len: usize,
+    pam_offset: usize,
+    pam_filter: &[u8],
+) -> bool {
+    let align_start = (end_pos + 1).saturating_sub(pattern_len);
+    for (k, &f) in pam_filter.iter().enumerate() {
+        let gpos = align_start + pam_offset + k;
+        if gpos >= ascii_chunk.len() {
+            return false;
+        }
+        let g = crate::bit4ops::char_to_bit4(ascii_chunk[gpos]);
+        if (g & f) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Precompute per-pattern PAM pre-check data:
+/// Returns (pam_offset, pam_filter_bit4) for each pattern.
+/// pam_offset = position in pattern where PAM (N-mask) starts.
+/// pam_filter_bit4 = the effective filter bytes at PAM positions only.
+fn precompute_pam_precheck(
+    pattern_is_n: &[Vec<bool>],
+    effective_filters_bit4: &[Vec<u8>],
+) -> Vec<(usize, Vec<u8>)> {
+    pattern_is_n
+        .iter()
+        .zip(effective_filters_bit4.iter())
+        .map(|(is_n, eff_filter)| {
+            let pam_start = is_n.iter().position(|&x| x).unwrap_or(is_n.len());
+            let pam_filter: Vec<u8> = (pam_start..is_n.len())
+                .filter(|&i| is_n[i])
+                .map(|i| eff_filter[i])
+                .collect();
+            (pam_start, pam_filter)
+        })
+        .collect()
+}
+
 fn search_chunk_myers(
     max_mismatches: u32,
     max_dna_bulges: u32,
@@ -513,6 +564,7 @@ fn search_chunk_myers(
     patterns_ascii: &[Vec<u8>],
     effective_filters_bit4: &[Vec<u8>],
     pattern_is_n: &[Vec<bool>],
+    pam_precheck: &[(usize, Vec<u8>)],
     peqs: &[crate::myers::PeqTable],
     chunk_data_bit4: &[u8; SEARCH_CHUNK_SIZE_BYTES],
     active_nucl: usize,
@@ -537,6 +589,8 @@ fn search_chunk_myers(
     let last_bit = 1u64 << (pattern_len - 1);
 
     for (p_idx, peq) in peqs.iter().enumerate() {
+        let (pam_offset, ref pam_filter) = pam_precheck[p_idx];
+
         // Myers sweep across the chunk
         let mut vp: u64 = mask;
         let mut vn: u64 = 0;
@@ -565,11 +619,15 @@ fn search_chunk_myers(
                 score -= 1;
             }
 
-            // Only consider matches once we've consumed at least pattern_len chars
             if t_pos + 1 < pattern_len {
                 continue;
             }
             if score < 0 || (score as u32) > max_edits {
+                continue;
+            }
+
+            // PAM pre-check: skip expensive traceback if PAM doesn't match
+            if !check_pam_quick(&ascii_chunk, t_pos, pattern_len, pam_offset, pam_filter) {
                 continue;
             }
 
@@ -600,12 +658,12 @@ fn search_device_cpu_thread_myers(
     patterns_ascii: Arc<Vec<Vec<u8>>>,
     effective_filters_bit4: Arc<Vec<Vec<u8>>>,
     pattern_is_n: Arc<Vec<Vec<bool>>>,
+    pam_precheck: Arc<Vec<(usize, Vec<u8>)>>,
     peqs: Arc<Vec<crate::myers::PeqTable>>,
     recv: crossbeam_channel::Receiver<SearchChunkInfo>,
     dest: mpsc::SyncSender<SearchChunkResultMyers>,
 ) {
     for schunk in recv.iter() {
-        // Determine active (non-padding) region: n_chunks * CHUNK_SIZE nucleotides
         let n_chunks = schunk.meta.chr_names.len();
         let active_nucl = n_chunks * CHUNK_SIZE;
         let (matches, alignments) = search_chunk_myers(
@@ -615,6 +673,7 @@ fn search_device_cpu_thread_myers(
             &patterns_ascii,
             &effective_filters_bit4,
             &pattern_is_n,
+            &pam_precheck,
             &peqs,
             &schunk.data,
             active_nucl,
@@ -663,9 +722,12 @@ fn search_compute_cpu_myers(
         })
         .collect();
 
+    let pam_precheck = precompute_pam_precheck(&pattern_is_n, &effective_filters_bit4);
+
     let peqs_arc = Arc::new(peqs);
     let is_n_arc = Arc::new(pattern_is_n);
     let filters_arc = Arc::new(effective_filters_bit4);
+    let pam_arc = Arc::new(pam_precheck);
     let patterns_arc = Arc::new(patterns_ascii.to_vec());
 
     let n_threads: usize = thread::available_parallelism().unwrap().into();
@@ -674,6 +736,7 @@ fn search_compute_cpu_myers(
         let t_pat = patterns_arc.clone();
         let t_filt = filters_arc.clone();
         let t_isn = is_n_arc.clone();
+        let t_pam = pam_arc.clone();
         let t_peqs = peqs_arc.clone();
         let t_recv = recv.clone();
         let t_dest = dest.clone();
@@ -685,6 +748,7 @@ fn search_compute_cpu_myers(
                 t_pat,
                 t_filt,
                 t_isn,
+                t_pam,
                 t_peqs,
                 t_recv,
                 t_dest,
@@ -717,7 +781,10 @@ unsafe fn search_device_ocl_myers(
     max_dna_bulges: u32,
     max_rna_bulges: u32,
     peq_array: Arc<Vec<u64>>,
+    pam_offsets_gpu: Arc<Vec<u8>>,
+    pam_filters_flat_gpu: Arc<Vec<u8>>,
     n_patterns: u32,
+    n_fwd_patterns: u32,
     patterns_ascii: Arc<Vec<Vec<u8>>>,
     pattern_is_n: Arc<Vec<Vec<bool>>>,
     effective_filters_bit4: Arc<Vec<Vec<u8>>>,
@@ -737,7 +804,11 @@ unsafe fn search_device_ocl_myers(
     let mut out_count = create_ocl_buf::<u32>(&context, 1)?;
     let mut out_buf = create_ocl_buf::<SearchMatch>(&context, OUT_BUF_SIZE)?;
     let mut peq_buf = create_ocl_buf::<u64>(&context, peq_array.len())?;
+    let mut pam_off_buf = create_ocl_buf::<u8>(&context, pam_offsets_gpu.len())?;
+    let mut pam_filt_buf = create_ocl_buf::<u8>(&context, pam_filters_flat_gpu.len())?;
     queue.enqueue_write_buffer(&mut peq_buf, CL_BLOCK, 0, &peq_array, &[])?;
+    queue.enqueue_write_buffer(&mut pam_off_buf, CL_BLOCK, 0, &pam_offsets_gpu, &[])?;
+    queue.enqueue_write_buffer(&mut pam_filt_buf, CL_BLOCK, 0, &pam_filters_flat_gpu, &[])?;
 
     let pattern_len = patterns_ascii[0].len();
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
@@ -759,11 +830,13 @@ unsafe fn search_device_ocl_myers(
         let clear_count_event =
             queue.enqueue_write_buffer(&mut out_count, CL_NO_BLOCK, 0, &[0u32], &[])?;
 
-        // Work dims: (n_active_nucl positions) x (n_patterns)
         let kernel_event = kernel::ExecuteKernel::new(&kernel)
             .set_arg(&genome_buf)
             .set_arg(&peq_buf)
+            .set_arg(&pam_off_buf)
+            .set_arg(&pam_filt_buf)
             .set_arg(&n_patterns)
+            .set_arg(&n_fwd_patterns)
             .set_arg(&n_active_nucl)
             .set_arg(&out_buf)
             .set_arg(&out_count)
@@ -886,18 +959,36 @@ fn search_chunk_ocl_myers(
         })
         .collect();
 
+    let pam_precheck = precompute_pam_precheck(&pattern_is_n, &effective_filters_bit4);
+
+    // Flatten PAM precheck for GPU buffers
+    let pam_len = pam_precheck.iter().map(|(_, f)| f.len()).max().unwrap_or(0);
+    let pam_offsets_gpu: Vec<u8> = pam_precheck.iter().map(|(off, _)| *off as u8).collect();
+    let mut pam_filters_flat_gpu: Vec<u8> = Vec::with_capacity(patterns_ascii.len() * pam_len);
+    for (_, ref filter) in &pam_precheck {
+        pam_filters_flat_gpu.extend_from_slice(filter);
+        // Pad to pam_len with 0xFF (match anything) if shorter
+        for _ in filter.len()..pam_len {
+            pam_filters_flat_gpu.push(0xFF);
+        }
+    }
+
     let peq_array = Arc::new(build_peq_array(&peqs));
+    let pam_off_arc = Arc::new(pam_offsets_gpu);
+    let pam_filt_arc = Arc::new(pam_filters_flat_gpu);
     let patterns_arc = Arc::new(patterns_ascii.to_vec());
     let is_n_arc = Arc::new(pattern_is_n);
     let filters_arc = Arc::new(effective_filters_bit4);
     let n_patterns = patterns_ascii.len() as u32;
+    let n_fwd_patterns = n_original_patterns as u32;
 
     let pattern_len = patterns_ascii[0].len();
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
     let text_window = pattern_len + max_dna_bulges as usize;
     let compile_defs = format!(
-        " -DPATTERN_LEN={} -DMAX_EDITS={} -DTEXT_WINDOW={} -DOUT_BUF_SIZE={}",
+        " -DPATTERN_LEN={} -DPAM_LEN={} -DMAX_EDITS={} -DTEXT_WINDOW={} -DOUT_BUF_SIZE={}",
         pattern_len,
+        pam_len,
         max_edits,
         text_window,
         1u32 << 22,
@@ -932,6 +1023,8 @@ fn search_chunk_ocl_myers(
                 let t_context = context.clone();
                 let t_prog = program.clone();
                 let t_peq = peq_array.clone();
+                let t_pam_off = pam_off_arc.clone();
+                let t_pam_filt = pam_filt_arc.clone();
                 let t_pat = patterns_arc.clone();
                 let t_isn = is_n_arc.clone();
                 let t_filt = filters_arc.clone();
@@ -941,7 +1034,10 @@ fn search_chunk_ocl_myers(
                         max_dna_bulges,
                         max_rna_bulges,
                         t_peq,
+                        t_pam_off,
+                        t_pam_filt,
                         n_patterns,
+                        n_fwd_patterns,
                         t_pat,
                         t_isn,
                         t_filt,
