@@ -179,12 +179,20 @@ pub fn traceback_all(
     let rna_cost: u32 = if max_rna_bulges == 0 { INF } else { 1 };
 
     // Fill DP as in `traceback`, so we can use dp[i][j] as a lower-bound prune.
+    // Text bytes equal to 0 are chromosome-boundary padding (bit4 0 decodes to
+    // NUL). Treat such cells as INF so alignments cannot pass through padding —
+    // otherwise multi-path enumeration happily emits bogus hits that straddle
+    // the gap between two concatenated chromosomes.
     let mut dp = vec![vec![0u32; n + 1]; m + 1];
     for i in 0..=m {
         dp[i][0] = (i as u32).saturating_mul(rna_cost).min(INF);
     }
     for i in 1..=m {
         for j in 1..=n {
+            if text[j - 1] == 0 {
+                dp[i][j] = INF;
+                continue;
+            }
             let match_cost = if cmp_loose(pattern[i - 1], text[j - 1]) { 0 } else { 1 };
             dp[i][j] = std::cmp::min(
                 dp[i - 1][j - 1].saturating_add(match_cost),

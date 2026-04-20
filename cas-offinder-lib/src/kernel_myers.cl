@@ -54,6 +54,7 @@ __kernel void find_matches_myers(
     __global const uchar* pam_filters_bit4,  // per-pattern, PAM_LEN entries
     uint n_patterns,
     uint n_fwd_patterns,
+    uint active_start_nucl,                  // skip positions < this (head overlap)
     uint total_nucl,
     __global struct s_match* out_matches,
     __global uint* out_count
@@ -63,6 +64,7 @@ __kernel void find_matches_myers(
 
     if (p >= n_patterns) return;
     if (j >= total_nucl) return;
+    if (j < active_start_nucl) return;       // skip head-overlap positions
     if (j + 1 < PATTERN_LEN) return;
 
     // ---- PAM pre-check: try each possible DNA bulge shift (for PAM-first
@@ -138,6 +140,10 @@ __kernel void find_matches_myers(
         dp[t] = 0;
     }
     // Only fill up through `text_len` so trailing cells at end are defined.
+    // Text bytes with bit4 == 0 mark chromosome-boundary padding (FASTA reader
+    // zero-fills the tail of partial chunks). Force such cells to INF_COST so
+    // no alignment path can cross into padding — otherwise candidates that
+    // straddle the gap between concatenated chromosomes leak into the output.
     for (uint pi = 1; pi <= PATTERN_LEN; pi++) {
         uchar pb4 = get_pattern(pattern_bit4, p, pi - 1);
         for (uint tj = 1; tj <= TEXT_WINDOW; tj++) {
@@ -146,6 +152,10 @@ __kernel void find_matches_myers(
                 continue;
             }
             uchar tb4 = get_bit4(genome_bit4, text_start + tj - 1);
+            if (tb4 == 0) {
+                dp[pi * (TEXT_WINDOW + 1) + tj] = INF_COST;
+                continue;
+            }
             uchar mc = ((pb4 & tb4) != 0) ? 0 : 1;
             uint diag = (uint)dp[(pi - 1) * (TEXT_WINDOW + 1) + (tj - 1)] + mc;
             uint up   = (uint)dp[(pi - 1) * (TEXT_WINDOW + 1) + tj] + (uint)rna_cost;
@@ -160,104 +170,203 @@ __kernel void find_matches_myers(
     uchar final_cost = dp[last_cell];
     if (final_cost > (uchar)MAX_EDITS) return;
 
-    // ---- Single-optimal traceback. Order of preference: diag > RNA > DNA.
-    // Records per-type counts and rejects if any transition breaks the PAM
-    // adjacency constraint (no sub at N cell; no bulge touching N cells).
+    // ---- Multi-path iterative DFS traceback.
+    //
+    // Enumerates every alignment with (mm <= MAX_MISMATCHES, db <= MAX_DNA_BULGES,
+    // rb <= MAX_RNA_BULGES, cost <= MAX_EDITS) by walking all valid backward
+    // transitions from (PATTERN_LEN, text_len) to (0, any). Pruning uses
+    // dp[i][j] as lower bound on remaining cost from (i, j) to (0, *) so the
+    // search visits only cells that can lead to at least one valid alignment.
+    //
+    // Frame layout (8 B) holds position + next transition to try + parent-state
+    // undo info (restore on pop so ops[] and per-type counters mirror recursion).
+    struct frame {
+        uchar pi;
+        uchar tj;
+        uchar trans;           // 0=diag, 1=RNA, 2=DNA, 3=done (pop)
+        uchar prev_ops_len;
+        uchar prev_cost;
+        uchar prev_mm;
+        uchar prev_db;
+        uchar prev_rb;
+    };
+    // Max DFS depth = pattern-decrementing transitions + DNA bulges
+    //   = PATTERN_LEN + MAX_DNA_BULGES (RNA bulges count toward pattern-dec).
+    struct frame stack[PATTERN_LEN + MAX_DNA_BULGES + 1];
     uchar ops[MAX_OPS];
+    uint sp = 0;
     uint ops_len = 0;
-    uint mm = 0, db = 0, rb = 0;
-    uint pi = PATTERN_LEN;
-    uint tj = text_len;
+    uchar cost = 0, mm = 0, db = 0, rb = 0;
 
-    while (pi > 0) {
-        bool moved = false;
-        uchar cur = dp[pi * (TEXT_WINDOW + 1) + tj];
+    stack[0].pi = PATTERN_LEN;
+    stack[0].tj = (uchar)text_len;
+    stack[0].trans = 0;
+    stack[0].prev_ops_len = 0;
+    stack[0].prev_cost = 0;
+    stack[0].prev_mm = 0;
+    stack[0].prev_db = 0;
+    stack[0].prev_rb = 0;
+    sp = 1;
 
-        if (tj > 0) {
-            uchar pb4 = get_pattern(pattern_bit4, p, pi - 1);
-            uchar tb4 = get_bit4(genome_bit4, text_start + tj - 1);
-            uchar mc = ((pb4 & tb4) != 0) ? 0 : 1;
-            if (cur == (uchar)((uint)dp[(pi - 1) * (TEXT_WINDOW + 1) + (tj - 1)] + mc)
-                && (mc == 0 || pb4 != 0x0F)) {
-                if (ops_len >= MAX_OPS) return;
-                ops[ops_len++] = (mc == 0) ? OP_MATCH : OP_SUB;
-                if (mc == 1) mm++;
-                pi--; tj--;
-                moved = true;
-            }
-        }
-        if (!moved && rna_cost != INF_COST) {
-            uchar pb4 = get_pattern(pattern_bit4, p, pi - 1);
-            if (cur == (uchar)((uint)dp[(pi - 1) * (TEXT_WINDOW + 1) + tj] + 1)
-                && pb4 != 0x0F
-                && rb < MAX_RNA_BULGES) {
-                if (ops_len >= MAX_OPS) return;
-                ops[ops_len++] = OP_RNA;
-                rb++;
-                pi--;
-                moved = true;
-            }
-        }
-        if (!moved && dna_cost != INF_COST && tj > 0) {
-            if (cur == (uchar)((uint)dp[pi * (TEXT_WINDOW + 1) + (tj - 1)] + 1)
-                && db < MAX_DNA_BULGES) {
-                uchar prev_n = (pi > 0) ? (get_pattern(pattern_bit4, p, pi - 1) == 0x0F) : 0;
-                uchar next_n = (pi < PATTERN_LEN) ? (get_pattern(pattern_bit4, p, pi) == 0x0F) : 0;
-                if (!prev_n && !next_n) {
-                    if (ops_len >= MAX_OPS) return;
-                    ops[ops_len++] = OP_DNA;
-                    db++;
-                    tj--;
-                    moved = true;
+    while (sp > 0) {
+        uint top = sp - 1;
+        uchar cpi = stack[top].pi;
+        uchar ctj = stack[top].tj;
+
+        if (cpi == 0) {
+            // ---- Leaf: emit this alignment. ----
+            // genome_span = non-gap text chars = PATTERN_LEN - rb + db
+            uint genome_span = (uint)PATTERN_LEN + (uint)db - (uint)rb;
+            uint match_start = j + 1 - genome_span;
+
+            // PAM verification walking ops forward (reverse of push order).
+            uint pi_fwd = 0;
+            uint g_off = 0;
+            bool pam_ok_full = true;
+            for (int oi = (int)ops_len - 1; oi >= 0; oi--) {
+                uchar op = ops[oi];
+                if (op == OP_MATCH || op == OP_SUB) {
+                    uchar pb4 = get_pattern(pattern_bit4, p, pi_fwd);
+                    if (pb4 == 0x0F) {
+                        uchar gb4 = get_bit4(genome_bit4, match_start + g_off);
+                        uint k = pi_fwd - pam_off;
+                        uchar f = pam_filters_bit4[p * PAM_LEN + k];
+                        if ((gb4 & f) == 0) { pam_ok_full = false; break; }
+                    }
+                    pi_fwd++; g_off++;
+                } else if (op == OP_DNA) {
+                    g_off++;
+                } else {
+                    pi_fwd++;
                 }
             }
-        }
-        if (!moved) return;  // no legal transition — alignment rejected
-    }
 
-    if (mm > MAX_MISMATCHES || db > MAX_DNA_BULGES || rb > MAX_RNA_BULGES) return;
-
-    // ---- PAM verification walking ops forward ----
-    // genome_span = non-gap text chars in alignment = PATTERN_LEN - rb + db
-    uint genome_span = PATTERN_LEN + db - rb;
-    uint match_start = j + 1 - genome_span;
-
-    uint pi_fwd = 0;
-    uint g_off = 0;
-    for (int oi = (int)ops_len - 1; oi >= 0; oi--) {
-        uchar op = ops[oi];
-        if (op == OP_MATCH || op == OP_SUB) {
-            uchar pb4 = get_pattern(pattern_bit4, p, pi_fwd);
-            if (pb4 == 0x0F) {
-                uchar gb4 = get_bit4(genome_bit4, match_start + g_off);
-                uint k = pi_fwd - pam_off;
-                uchar f = pam_filters_bit4[p * PAM_LEN + k];
-                if ((gb4 & f) == 0) return;
+            if (pam_ok_full) {
+                ulong ops_packed = 0;
+                for (uint k = 0; k < ops_len; k++) {
+                    ops_packed |= ((ulong)ops[k]) << (k * 2);
+                }
+                uint idx = atomic_inc(out_count);
+                if (idx < OUT_BUF_SIZE) {
+                    out_matches[idx].chunk_idx = match_start;
+                    out_matches[idx].pattern_idx = p;
+                    out_matches[idx].ops_packed = ops_packed;
+                    out_matches[idx].mismatches = mm;
+                    out_matches[idx].dna_bulge_size = (ushort)db;
+                    out_matches[idx].rna_bulge_size = (ushort)rb;
+                    out_matches[idx].ops_count = ops_len;
+                    out_matches[idx]._pad = 0;
+                }
             }
-            pi_fwd++;
-            g_off++;
-        } else if (op == OP_DNA) {
-            g_off++;
-        } else {  // RNA
-            pi_fwd++;
+
+            // Pop leaf and restore parent state.
+            ops_len = stack[top].prev_ops_len;
+            cost = stack[top].prev_cost;
+            mm = stack[top].prev_mm;
+            db = stack[top].prev_db;
+            rb = stack[top].prev_rb;
+            sp--;
+            continue;
         }
-    }
 
-    // ---- Pack ops and emit ----
-    ulong ops_packed = 0;
-    for (uint k = 0; k < ops_len; k++) {
-        ops_packed |= ((ulong)ops[k]) << (k * 2);
-    }
+        uchar trans = stack[top].trans;
 
-    uint idx = atomic_inc(out_count);
-    if (idx < OUT_BUF_SIZE) {
-        out_matches[idx].chunk_idx = match_start;
-        out_matches[idx].pattern_idx = p;
-        out_matches[idx].ops_packed = ops_packed;
-        out_matches[idx].mismatches = mm;
-        out_matches[idx].dna_bulge_size = (ushort)db;
-        out_matches[idx].rna_bulge_size = (ushort)rb;
-        out_matches[idx].ops_count = ops_len;
-        out_matches[idx]._pad = 0;
+        // ---- Try diagonal (match / substitution). ----
+        if (trans == 0) {
+            stack[top].trans = 1;
+            if (ctj > 0) {
+                uchar pb4 = get_pattern(pattern_bit4, p, cpi - 1);
+                uchar tb4 = get_bit4(genome_bit4, text_start + ctj - 1);
+                uchar mc = ((pb4 & tb4) != 0) ? 0 : 1;
+                if (mc == 0 || pb4 != 0x0F) {
+                    uchar new_cost = cost + mc;
+                    uchar new_mm = mm + mc;
+                    uchar rem = dp[(cpi - 1) * (TEXT_WINDOW + 1) + (ctj - 1)];
+                    if ((uint)new_cost + (uint)rem <= (uint)MAX_EDITS
+                        && new_mm <= MAX_MISMATCHES
+                        && ops_len < MAX_OPS) {
+                        // Save parent state in the new child frame; then apply transition.
+                        stack[sp].pi = cpi - 1;
+                        stack[sp].tj = ctj - 1;
+                        stack[sp].trans = 0;
+                        stack[sp].prev_ops_len = (uchar)ops_len;
+                        stack[sp].prev_cost = cost;
+                        stack[sp].prev_mm = mm;
+                        stack[sp].prev_db = db;
+                        stack[sp].prev_rb = rb;
+                        ops[ops_len++] = (mc == 0) ? OP_MATCH : OP_SUB;
+                        cost = new_cost;
+                        mm = new_mm;
+                        sp++;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // ---- Try RNA bulge (gap in text). ----
+        if (trans == 1) {
+            stack[top].trans = 2;
+            if (rna_cost != INF_COST && rb < MAX_RNA_BULGES) {
+                uchar pb4 = get_pattern(pattern_bit4, p, cpi - 1);
+                if (pb4 != 0x0F) {
+                    uchar new_cost = cost + 1;
+                    uchar rem = dp[(cpi - 1) * (TEXT_WINDOW + 1) + ctj];
+                    if ((uint)new_cost + (uint)rem <= (uint)MAX_EDITS
+                        && ops_len < MAX_OPS) {
+                        stack[sp].pi = cpi - 1;
+                        stack[sp].tj = ctj;
+                        stack[sp].trans = 0;
+                        stack[sp].prev_ops_len = (uchar)ops_len;
+                        stack[sp].prev_cost = cost;
+                        stack[sp].prev_mm = mm;
+                        stack[sp].prev_db = db;
+                        stack[sp].prev_rb = rb;
+                        ops[ops_len++] = OP_RNA;
+                        cost = new_cost;
+                        rb++;
+                        sp++;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // ---- Try DNA bulge (gap in pattern). ----
+        if (trans == 2) {
+            stack[top].trans = 3;
+            if (dna_cost != INF_COST && db < MAX_DNA_BULGES && ctj > 0) {
+                uchar prev_n = (cpi > 0) ? (get_pattern(pattern_bit4, p, cpi - 1) == 0x0F) : 0;
+                uchar next_n = (cpi < PATTERN_LEN) ? (get_pattern(pattern_bit4, p, cpi) == 0x0F) : 0;
+                if (!prev_n && !next_n) {
+                    uchar new_cost = cost + 1;
+                    uchar rem = dp[cpi * (TEXT_WINDOW + 1) + (ctj - 1)];
+                    if ((uint)new_cost + (uint)rem <= (uint)MAX_EDITS
+                        && ops_len < MAX_OPS) {
+                        stack[sp].pi = cpi;
+                        stack[sp].tj = ctj - 1;
+                        stack[sp].trans = 0;
+                        stack[sp].prev_ops_len = (uchar)ops_len;
+                        stack[sp].prev_cost = cost;
+                        stack[sp].prev_mm = mm;
+                        stack[sp].prev_db = db;
+                        stack[sp].prev_rb = rb;
+                        ops[ops_len++] = OP_DNA;
+                        cost = new_cost;
+                        db++;
+                        sp++;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // trans == 3: all transitions tried; pop and restore parent state.
+        ops_len = stack[top].prev_ops_len;
+        cost = stack[top].prev_cost;
+        mm = stack[top].prev_mm;
+        db = stack[top].prev_db;
+        rb = stack[top].prev_rb;
+        sp--;
     }
 }

@@ -72,6 +72,22 @@ struct SearchChunkMeta {
     // start and end of data within chromosome, by nucleotide
     pub chunk_starts: Vec<u64>,
     pub chunk_ends: Vec<u64>,
+    // Byte offset of each chunk inside `SearchChunkInfo.data`. Tight-packed,
+    // with entry k holding the start of chunk k and one trailing sentinel at
+    // chr_names.len() marking the end of all valid bytes. A chunk whose valid
+    // nucleotide count is odd occupies ceil(N/2) bytes; the unused high nibble
+    // of its last byte is 0 (bit4 NUL) and gets rejected by the DP.
+    pub chunk_byte_offsets: Vec<u32>,
+    // True when chunk_buf had `chunks_per_search()` items (full batch); the
+    // last chunk is overlap that will be re-sent as the first of the next
+    // batch, so matches starting in it must not be emitted here.
+    pub has_overlap_tail: bool,
+    // True when the first chunk is carried over from the previous batch as
+    // backward-context (so a text window near the start of chunk 1 can read
+    // into chunk 0 without falling off the search buffer). Matches whose
+    // end_pos lies in chunk 0 must not be emitted from this batch — they were
+    // already iterated in the previous batch where chunk 0 was the active tail.
+    pub has_overlap_head: bool,
 }
 
 struct SearchChunkInfo {
@@ -129,11 +145,19 @@ const GPU_OP_RNA: u8 = 3;
 /// Decode a [`GpuEnumMatch`] into a (SearchMatch, MyersAlignment) pair by
 /// walking the packed ops (in reverse of traceback order = forward alignment
 /// order) and pulling the corresponding characters from pattern + genome.
+///
+/// Returns `None` if the alignment touches a padding region between concatenated
+/// chromosome chunks (NUL / 0x00 in the decoded ASCII buffer). The GPU kernel
+/// is chromosome-unaware — it scans a contiguous search buffer that includes
+/// trailing zero-padding after each partial chromosome chunk — so a valid
+/// Myers candidate can technically land where one strand of the alignment
+/// crosses into NUL territory. Such matches are not real hits and get dropped
+/// here.
 fn decode_gpu_enum_match(
     raw: &GpuEnumMatch,
     ascii_chunk: &[u8],
     pattern_ascii: &[u8],
-) -> (SearchMatch, MyersAlignment) {
+) -> Option<(SearchMatch, MyersAlignment)> {
     let ops_count = raw.ops_count as usize;
     let mut pattern_aligned: Vec<u8> = Vec::with_capacity(ops_count);
     let mut text_aligned: Vec<u8> = Vec::with_capacity(ops_count);
@@ -143,14 +167,22 @@ fn decode_gpu_enum_match(
         let op = ((raw.ops_packed >> (k_rev * 2)) & 0x3) as u8;
         match op {
             GPU_OP_MATCH | GPU_OP_SUB => {
+                let ch = ascii_chunk[gi];
+                if ch == 0 {
+                    return None;
+                }
                 pattern_aligned.push(pattern_ascii[pi]);
-                text_aligned.push(ascii_chunk[gi]);
+                text_aligned.push(ch);
                 pi += 1;
                 gi += 1;
             }
             GPU_OP_DNA => {
+                let ch = ascii_chunk[gi];
+                if ch == 0 {
+                    return None;
+                }
                 pattern_aligned.push(b'-');
-                text_aligned.push(ascii_chunk[gi]);
+                text_aligned.push(ch);
                 gi += 1;
             }
             GPU_OP_RNA => {
@@ -161,7 +193,7 @@ fn decode_gpu_enum_match(
             _ => unreachable!("invalid op code {}", op),
         }
     }
-    (
+    Some((
         SearchMatch {
             chunk_idx: raw.chunk_idx,
             pattern_idx: raw.pattern_idx,
@@ -173,7 +205,7 @@ fn decode_gpu_enum_match(
             pattern_aligned,
             text_aligned,
         },
-    )
+    ))
 }
 
 const MAX_QUEUED: usize = 1;
@@ -225,8 +257,15 @@ fn search_device_ocl(
         assert!(patterns.len() % pattern_blocked_size == 0);
         let n_patterns = patterns.len() / pattern_blocked_size;
         for item in recv.iter() {
-            let n_chunks = std::cmp::min(chunks_per_search() - 1, item.meta.chr_names.len());
-            let n_genome_bytes = n_chunks * CHUNK_SIZE_BYTES;
+            let total_chunks = item.meta.chr_names.len();
+            let n_chunks = if item.meta.has_overlap_tail {
+                total_chunks - 1
+            } else {
+                total_chunks
+            };
+            let n_genome_bytes = item.meta.chunk_byte_offsets[n_chunks] as usize;
+            let n_total_bytes =
+                *item.meta.chunk_byte_offsets.last().unwrap() as usize;
             let n_genome_blocks = n_genome_bytes / prefered_block_size(&dev)?;
             let n_genome_execs = n_genome_blocks / CL_BLOCKS_PER_EXEC;
             let cur_genome_buf = &mut genome_bufs[0];
@@ -236,7 +275,7 @@ fn search_device_ocl(
                 cur_genome_buf,
                 CL_NO_BLOCK,
                 0,
-                &item.data[..n_genome_bytes + CHUNK_SIZE_BYTES],
+                &item.data[..n_total_bytes],
                 &[],
             )?;
             let clear_count_event =
@@ -686,10 +725,11 @@ fn search_chunk_myers(
     pam_precheck: &[(usize, Vec<u8>)],
     peqs: &[crate::myers::PeqTable],
     chunk_data_bit4: &[u8],
-    active_nucl: usize,
+    active_start_nucl: usize,
+    active_end_nucl: usize,
 ) -> (Vec<SearchMatch>, Vec<MyersAlignment>) {
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
-    let total_nucl = active_nucl.min(chunk_data_bit4.len() * 2);
+    let total_nucl = active_end_nucl.min(chunk_data_bit4.len() * 2);
     let pattern_len = patterns_ascii[0].len();
     let text_window_len = pattern_len + max_dna_bulges as usize;
 
@@ -707,46 +747,60 @@ fn search_chunk_myers(
     };
     let last_bit = 1u64 << (pattern_len - 1);
 
+    // Per-position windowed Myers on BIT4, byte-for-byte the same operation
+    // as the GPU kernel. CPU and GPU now consume the same encoding (no lossy
+    // ASCII round-trip) and produce identical candidate sets.
+    let get_bit4 = |i: usize| -> u8 {
+        let byte = chunk_data_bit4[i / 2];
+        if i % 2 == 0 {
+            byte & 0x0F
+        } else {
+            (byte >> 4) & 0x0F
+        }
+    };
     for (p_idx, peq) in peqs.iter().enumerate() {
         let (pam_offset, ref pam_filter) = pam_precheck[p_idx];
 
-        // Myers sweep across the chunk
-        let mut vp: u64 = mask;
-        let mut vn: u64 = 0;
-        let mut score: i32 = pattern_len as i32;
-
-        for (t_pos, &c) in ascii_chunk.iter().enumerate() {
-            let idx = nucl_idx_ascii(c);
-            let eq = if idx < 4 {
-                peq.peq[idx as usize]
-            } else {
-                peq.peq[0] | peq.peq[1] | peq.peq[2] | peq.peq[3]
-            };
-            let x = eq | vn;
-            let d0 = (((x & vp).wrapping_add(vp)) ^ vp) | x;
-            let hn = vp & d0;
-            let hp = vn | !(vp | d0);
-            let x_shift = hp << 1;
-            vn = x_shift & d0;
-            vp = (hn << 1) | !(x_shift | d0);
-            vp &= mask;
-            vn &= mask;
-            if hp & last_bit != 0 {
-                score += 1;
-            }
-            if hn & last_bit != 0 {
-                score -= 1;
-            }
-
+        for t_pos in active_start_nucl..total_nucl {
             if t_pos + 1 < pattern_len {
                 continue;
             }
-            if score < 0 || (score as u32) > max_edits {
+
+            // PAM pre-check first (cheap fail-fast, same order as kernel)
+            if !check_pam_quick(&ascii_chunk, t_pos, pattern_len, pam_offset, pam_filter, max_dna_bulges) {
                 continue;
             }
 
-            // PAM pre-check: skip expensive traceback if PAM doesn't match
-            if !check_pam_quick(&ascii_chunk, t_pos, pattern_len, pam_offset, pam_filter, max_dna_bulges) {
+            // Fresh Myers sweep over the candidate's text window, mirroring
+            // the GPU kernel exactly. Bit4 NUL (0) contributes no peq bits.
+            let text_start = (t_pos + 1).saturating_sub(text_window_len);
+            let mut vp: u64 = mask;
+            let mut vn: u64 = 0;
+            let mut score: i32 = pattern_len as i32;
+            for t in text_start..=t_pos {
+                let b4 = get_bit4(t);
+                let mut eq: u64 = 0;
+                if b4 & 0x4 != 0 { eq |= peq.peq[0]; } // A
+                if b4 & 0x2 != 0 { eq |= peq.peq[1]; } // C
+                if b4 & 0x8 != 0 { eq |= peq.peq[2]; } // G
+                if b4 & 0x1 != 0 { eq |= peq.peq[3]; } // T
+                let x = eq | vn;
+                let d0 = (((x & vp).wrapping_add(vp)) ^ vp) | x;
+                let hn = vp & d0;
+                let hp = vn | !(vp | d0);
+                let x_shift = hp << 1;
+                vn = x_shift & d0;
+                vp = (hn << 1) | !(x_shift | d0);
+                vp &= mask;
+                vn &= mask;
+                if hp & last_bit != 0 {
+                    score += 1;
+                }
+                if hn & last_bit != 0 {
+                    score -= 1;
+                }
+            }
+            if score < 0 || (score as u32) > max_edits {
                 continue;
             }
 
@@ -783,8 +837,21 @@ fn search_device_cpu_thread_myers(
     dest: mpsc::SyncSender<SearchChunkResultMyers>,
 ) {
     for schunk in recv.iter() {
-        let n_chunks = schunk.meta.chr_names.len();
-        let active_nucl = n_chunks * CHUNK_SIZE;
+        let total_chunks = schunk.meta.chr_names.len();
+        let n_chunks = if schunk.meta.has_overlap_tail {
+            total_chunks - 1
+        } else {
+            total_chunks
+        };
+        // Active iteration range: skip the head-overlap chunk (exists only to
+        // provide backward text-window context for chunk 1); iterate through
+        // the tail-overlap exclusion that has_overlap_tail already applies.
+        let active_start_nucl = if schunk.meta.has_overlap_head {
+            schunk.meta.chunk_byte_offsets[1] as usize * 2
+        } else {
+            0
+        };
+        let active_end_nucl = schunk.meta.chunk_byte_offsets[n_chunks] as usize * 2;
         let (matches, alignments) = search_chunk_myers(
             max_mismatches,
             max_dna_bulges,
@@ -795,7 +862,8 @@ fn search_device_cpu_thread_myers(
             &pam_precheck,
             &peqs,
             &schunk.data,
-            active_nucl,
+            active_start_nucl,
+            active_end_nucl,
         );
         dest.send(SearchChunkResultMyers {
             matches,
@@ -931,10 +999,22 @@ unsafe fn search_device_ocl_myers(
     queue.enqueue_write_buffer(&mut pam_filt_buf, CL_BLOCK, 0, &pam_filters_flat_gpu, &[])?;
 
     for item in recv.iter() {
-        let n_chunks = std::cmp::min(chunks_per_search() - 1, item.meta.chr_names.len());
-        let n_active_nucl: u32 = (n_chunks * CHUNK_SIZE) as u32;
-        let n_write_bytes = (n_chunks * CHUNK_SIZE_BYTES + CHUNK_SIZE_BYTES)
-            .min(search_chunk_bytes());
+        // With tight packing, chunks are variable-size. `n_chunks` is the
+        // number of "active" chunks (emit matches from these). If this batch
+        // carries an overlap-tail chunk, we stop iterating before it.
+        let total_chunks = item.meta.chr_names.len();
+        let n_chunks = if item.meta.has_overlap_tail {
+            total_chunks - 1
+        } else {
+            total_chunks
+        };
+        let active_start_nucl: u32 = if item.meta.has_overlap_head {
+            item.meta.chunk_byte_offsets[1] as u32 * 2
+        } else {
+            0
+        };
+        let n_active_nucl: u32 = item.meta.chunk_byte_offsets[n_chunks] as u32 * 2;
+        let n_write_bytes = *item.meta.chunk_byte_offsets.last().unwrap() as usize;
 
         let write_event = queue.enqueue_write_buffer(
             &mut genome_buf,
@@ -954,6 +1034,7 @@ unsafe fn search_device_ocl_myers(
             .set_arg(&pam_filt_buf)
             .set_arg(&n_patterns)
             .set_arg(&_n_fwd_patterns)
+            .set_arg(&active_start_nucl)
             .set_arg(&n_active_nucl)
             .set_arg(&out_buf)
             .set_arg(&out_count)
@@ -1005,7 +1086,7 @@ unsafe fn search_device_ocl_myers(
         use rayon::prelude::*;
         let decoded: Vec<(SearchMatch, MyersAlignment)> = raw_matches
             .par_iter()
-            .map(|raw| {
+            .filter_map(|raw| {
                 let pattern_ascii = &patterns_ascii[raw.pattern_idx as usize];
                 decode_gpu_enum_match(raw, &ascii_chunk, pattern_ascii)
             })
@@ -1179,19 +1260,33 @@ fn search_chunk_ocl_myers(
 fn convert_matches_myers(
     patterns_ascii: &[Vec<u8>],
     pattern_len: usize,
+    max_dna_bulges: u32,
     search_res: SearchChunkResultMyers,
 ) -> Vec<Match> {
     let n_orig = patterns_ascii.len() / 2;
     let mut results: Vec<Match> = Vec::new();
+    let n_chunks = search_res.meta.chr_names.len();
+    // Max text extent of a candidate = pattern_len + max_dna_bulges. Needed
+    // for the end-of-chromosome check so a bulge match can't leak its tail
+    // past the chromosome boundary.
+    let max_text_extent = pattern_len as u64 + max_dna_bulges as u64;
     for (smatch, align) in search_res.matches.iter().zip(search_res.alignments.iter()) {
-        let chunk_pos = smatch.chunk_idx as usize;
-        let idx = chunk_pos / CHUNK_SIZE;
-        let offset = chunk_pos % CHUNK_SIZE;
+        // chunk_idx is the nucleotide index within the tight-packed search buffer;
+        // locate its owning chunk via binary search on chunk_byte_offsets (byte units).
+        let nucl_pos = smatch.chunk_idx as usize;
+        let byte_pos = nucl_pos / 2;
+        let idx = search_res
+            .meta
+            .chunk_byte_offsets
+            .partition_point(|&off| (off as usize) <= byte_pos)
+            .saturating_sub(1);
+        let chunk_byte_base = search_res.meta.chunk_byte_offsets[idx] as usize;
+        let offset = nucl_pos - chunk_byte_base * 2;
         let pos = search_res.meta.chunk_starts[idx] + offset as u64;
-        let is_last_chunk = idx == chunks_per_search() - 1;
-        let is_end_chrom = idx == search_res.meta.chr_names.len() - 1
+        let is_last_chunk = search_res.meta.has_overlap_tail && idx == n_chunks - 1;
+        let is_end_chrom = idx == n_chunks - 1
             || search_res.meta.chunk_starts[idx + 1] == 0;
-        let is_past_end = pos + pattern_len as u64 > search_res.meta.chunk_ends[idx];
+        let is_past_end = pos + max_text_extent > search_res.meta.chunk_ends[idx];
         if is_last_chunk || (is_end_chrom && is_past_end) {
             continue;
         }
@@ -1220,31 +1315,55 @@ fn convert_matches_myers(
     results
 }
 
-fn chunks_to_searchchunk(chunk_buf: &[ChromChunkInfo]) -> SearchChunkInfo {
-    // Runtime-sized buffer; holds chunks_per_search() CHUNK_SIZE_BYTES chunks.
+fn chunks_to_searchchunk(
+    chunk_buf: &[ChromChunkInfo],
+    has_overlap_tail: bool,
+    has_overlap_head: bool,
+) -> SearchChunkInfo {
+    // Tight-pack the buffer: each chunk contributes `ceil(valid_nucl / 2)`
+    // bytes, laid out contiguously. This removes the per-chromosome NUL
+    // padding that fixed-stride packing would leave behind. chunk_byte_offsets
+    // gives the start of each chunk + one sentinel so downstream code can
+    // binary-search a genome position back to its chunk.
     let cps = chunks_per_search();
-    let mut search_buf: Box<[u8]> = vec![0_u8; search_chunk_bytes()].into_boxed_slice();
+    let max_bytes = search_chunk_bytes();
+    let mut search_buf: Box<[u8]> = vec![0_u8; max_bytes].into_boxed_slice();
     let mut names: Vec<String> = Vec::with_capacity(cps);
     let mut starts: Vec<u64> = Vec::with_capacity(cps);
     let mut ends: Vec<u64> = Vec::with_capacity(cps);
-    // only takes  chunks_per_search()-1 chunks because you don't want to leave any hanging data on the end
+    let mut byte_offsets: Vec<u32> = Vec::with_capacity(cps + 1);
+
+    let mut cur_bytes: usize = 0;
     for (idx, chunk) in chunk_buf.iter().enumerate() {
         assert!(
             idx == 0 || *ends.last().unwrap() == chunk.chunk_start || chunk.chunk_start == 0,
             "search expects chromosome chunks to arrive in order"
         );
-        search_buf[idx * CHUNK_SIZE_BYTES..(idx + 1) * CHUNK_SIZE_BYTES]
-            .copy_from_slice(&chunk.data[..]);
+        let valid_nucl = (chunk.chunk_end - chunk.chunk_start) as usize;
+        let valid_bytes = (valid_nucl + 1) / 2;
+        assert!(
+            cur_bytes + valid_bytes <= max_bytes,
+            "tight-packed chunks exceed search_chunk_bytes budget"
+        );
+        byte_offsets.push(cur_bytes as u32);
+        search_buf[cur_bytes..cur_bytes + valid_bytes]
+            .copy_from_slice(&chunk.data[..valid_bytes]);
         names.push(chunk.chr_name.clone());
         starts.push(chunk.chunk_start);
         ends.push(chunk.chunk_end);
+        cur_bytes += valid_bytes;
     }
+    byte_offsets.push(cur_bytes as u32); // sentinel: end of last chunk
+
     SearchChunkInfo {
         data: search_buf,
         meta: SearchChunkMeta {
             chr_names: names,
             chunk_starts: starts,
             chunk_ends: ends,
+            chunk_byte_offsets: byte_offsets,
+            has_overlap_tail,
+            has_overlap_head,
         },
     }
 }
@@ -1259,11 +1378,18 @@ fn convert_matches(
     assert!(n_blocks == search_res.meta.chr_names.len());
     let mut results: Vec<Match> = Vec::new();
     for smatch in search_res.matches.iter() {
-        let idx = smatch.chunk_idx as usize / CHUNK_SIZE;
-        let offset = smatch.chunk_idx as usize % CHUNK_SIZE;
+        let nucl_pos = smatch.chunk_idx as usize;
+        let byte_pos = nucl_pos / 2;
+        let idx = search_res
+            .meta
+            .chunk_byte_offsets
+            .partition_point(|&off| (off as usize) <= byte_pos)
+            .saturating_sub(1);
+        let chunk_byte_base = search_res.meta.chunk_byte_offsets[idx] as usize;
+        let offset = nucl_pos - chunk_byte_base * 2;
         let pos = search_res.meta.chunk_starts[idx] + offset as u64;
         //skip anything in the last chunk, it will be repeated again in the next search item
-        let is_last_chunk = idx == chunks_per_search() - 1;
+        let is_last_chunk = search_res.meta.has_overlap_tail && idx == n_blocks - 1;
         let is_end_chrom = idx == search_res.meta.chr_names.len() - 1
             || search_res.meta.chunk_starts[idx + 1] == 0;
         let is_past_end = pos + pattern_len as u64 > search_res.meta.chunk_ends[idx];
@@ -1348,17 +1474,27 @@ pub fn search(
         .stack_size(search_chunk_bytes() * 2)
         .spawn(move || {
             let mut buf: Vec<ChromChunkInfo> = Vec::with_capacity(cps_outer);
+            // `has_head` is true once the buffer carries a chunk brought over
+            // from a previous batch as pre-overlap (backward context for
+            // chunk 1). First batch ever has none. Each batch iterates ALL
+            // chunks except the head-overlap one, so there is no tail overlap.
+            let mut has_head = false;
             loop {
                 let res = recv.recv();
                 match res {
                     Ok(chunk) => {
                         buf.push(chunk);
                         if buf.len() == cps_outer {
-                            compute_send_src.send(chunks_to_searchchunk(&buf)).unwrap();
-                            let last_el = buf.pop().unwrap();
+                            compute_send_src
+                                .send(chunks_to_searchchunk(&buf, false, has_head))
+                                .unwrap();
+                            // Clone the last chunk as pre-overlap for next batch.
+                            // Clone is fine because we only need its metadata
+                            // and data for backward context, not ownership.
+                            let last_el = buf.last().cloned().unwrap();
                             buf.clear();
-                            //last element is now first element so that no patterns are cut off
                             buf.push(last_el);
+                            has_head = true;
                         }
                     }
                     Err(_err) => {
@@ -1367,7 +1503,12 @@ pub fn search(
                 }
             }
             if !buf.is_empty() {
-                compute_send_src.send(chunks_to_searchchunk(&buf)).unwrap();
+                // Avoid re-emitting the sole pre-overlap chunk as its own batch.
+                if !(has_head && buf.len() == 1) {
+                    compute_send_src
+                        .send(chunks_to_searchchunk(&buf, false, has_head))
+                        .unwrap();
+                }
             }
         })
         .unwrap();
@@ -1385,6 +1526,7 @@ pub fn search(
                 dest.send(convert_matches_myers(
                     &patterns_ascii_clone,
                     pattern_len,
+                    max_dna_bulges,
                     search_chunk,
                 ))
                 .unwrap();

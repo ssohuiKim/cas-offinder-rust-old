@@ -1,6 +1,7 @@
 pub const CHUNK_SIZE: usize = 1 << 16;
 pub const CHUNK_SIZE_BYTES: usize = CHUNK_SIZE / 2;
 
+#[derive(Clone)]
 pub struct ChromChunkInfo {
     pub chr_name: String,
     // fixed size chunk data
