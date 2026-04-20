@@ -147,6 +147,190 @@ pub fn traceback(
     })
 }
 
+/// Enumerate ALL distinct alignments of `pattern` ending at `text.len()` that
+/// satisfy the per-type caps (mismatches, dna_bulges, rna_bulges).
+///
+/// Unlike [`traceback`] which returns one optimum, this walks every valid path
+/// through the DP. Callers receive one [`Alignment`] per distinct gap placement,
+/// matching the original cas-offinder behavior where different bulge
+/// placements at the same end position are reported as separate hits.
+///
+/// `pam_is_n[k]` marks pattern position k as a PAM cell; bulges adjacent to
+/// such cells are pruned (cas-offinder convention: no gaps in the PAM region).
+///
+/// Performance: the DP is filled once (O(m·n)) and then the DFS is pruned by
+/// (a) per-type caps and (b) `dp[i][j]` lower bound on remaining cost. In
+/// practice this emits only a handful of alignments per candidate.
+pub fn traceback_all(
+    pattern: &[u8],
+    text: &[u8],
+    max_edits: u32,
+    max_dna_bulges: u32,
+    max_rna_bulges: u32,
+    max_mismatches: u32,
+    pam_is_n: &[bool],
+) -> Vec<Alignment> {
+    let m = pattern.len();
+    let n = text.len();
+    debug_assert_eq!(pam_is_n.len(), m);
+
+    const INF: u32 = u32::MAX / 2;
+    let dna_cost: u32 = if max_dna_bulges == 0 { INF } else { 1 };
+    let rna_cost: u32 = if max_rna_bulges == 0 { INF } else { 1 };
+
+    // Fill DP as in `traceback`, so we can use dp[i][j] as a lower-bound prune.
+    let mut dp = vec![vec![0u32; n + 1]; m + 1];
+    for i in 0..=m {
+        dp[i][0] = (i as u32).saturating_mul(rna_cost).min(INF);
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            let match_cost = if cmp_loose(pattern[i - 1], text[j - 1]) { 0 } else { 1 };
+            dp[i][j] = std::cmp::min(
+                dp[i - 1][j - 1].saturating_add(match_cost),
+                std::cmp::min(
+                    dp[i - 1][j].saturating_add(rna_cost),
+                    dp[i][j - 1].saturating_add(dna_cost),
+                ),
+            );
+        }
+    }
+    if dp[m][n] > max_edits {
+        return Vec::new();
+    }
+
+    let mut results: Vec<Alignment> = Vec::new();
+    let mut ops: Vec<EditOp> = Vec::new();
+    enumerate(
+        m, n,
+        &mut ops,
+        0, 0, 0, 0,
+        &dp, pattern, text,
+        max_edits, max_dna_bulges, max_rna_bulges, max_mismatches,
+        pam_is_n,
+        &mut results,
+    );
+    results
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate(
+    i: usize,
+    j: usize,
+    ops: &mut Vec<EditOp>,
+    cost: u32,
+    mm: u32,
+    db: u32,
+    rb: u32,
+    dp: &[Vec<u32>],
+    pattern: &[u8],
+    text: &[u8],
+    max_edits: u32,
+    max_dna: u32,
+    max_rna: u32,
+    max_mm: u32,
+    pam_is_n: &[bool],
+    results: &mut Vec<Alignment>,
+) {
+    // Prune: any path through (i,j) has total cost >= cost + dp[i][j].
+    if cost.saturating_add(dp[i][j]) > max_edits {
+        return;
+    }
+    if mm > max_mm || db > max_dna || rb > max_rna {
+        return;
+    }
+    if i == 0 {
+        // Reached pattern start; semi-global text prefix is free.
+        // ops was pushed in walk-back order; reverse for output.
+        let mut ops_fwd = ops.clone();
+        ops_fwd.reverse();
+        let mut pa: Vec<u8> = Vec::with_capacity(ops_fwd.len());
+        let mut ta: Vec<u8> = Vec::with_capacity(ops_fwd.len());
+        let mut pi = 0usize;
+        let mut ti = j;
+        for op in &ops_fwd {
+            match op {
+                EditOp::Match | EditOp::Substitution => {
+                    pa.push(pattern[pi]);
+                    ta.push(text[ti]);
+                    pi += 1;
+                    ti += 1;
+                }
+                EditOp::RnaBulge => {
+                    pa.push(pattern[pi]);
+                    ta.push(b'-');
+                    pi += 1;
+                }
+                EditOp::DnaBulge => {
+                    pa.push(b'-');
+                    ta.push(text[ti]);
+                    ti += 1;
+                }
+            }
+        }
+        results.push(Alignment {
+            ops: ops_fwd,
+            pattern_aligned: pa,
+            text_aligned: ta,
+            text_start: j,
+            mismatches: mm,
+            dna_bulges: db,
+            rna_bulges: rb,
+        });
+        return;
+    }
+
+    // Diagonal: match / substitution
+    if j > 0 {
+        let mc = if cmp_loose(pattern[i - 1], text[j - 1]) { 0 } else { 1 };
+        let touches_n = mc == 1 && pam_is_n[i - 1];
+        if !touches_n {
+            ops.push(if mc == 0 { EditOp::Match } else { EditOp::Substitution });
+            enumerate(
+                i - 1, j - 1, ops,
+                cost + mc, mm + mc, db, rb,
+                dp, pattern, text,
+                max_edits, max_dna, max_rna, max_mm,
+                pam_is_n, results,
+            );
+            ops.pop();
+        }
+    }
+
+    // RNA bulge: pattern[i-1] consumed, no text char.
+    if rb < max_rna && max_rna > 0 {
+        let pattern_pos_is_n = pam_is_n[i - 1];
+        if !pattern_pos_is_n {
+            ops.push(EditOp::RnaBulge);
+            enumerate(
+                i - 1, j, ops,
+                cost + 1, mm, db, rb + 1,
+                dp, pattern, text,
+                max_edits, max_dna, max_rna, max_mm,
+                pam_is_n, results,
+            );
+            ops.pop();
+        }
+    }
+
+    // DNA bulge: text char consumed, no pattern char. Skip if adjacent to PAM.
+    if db < max_dna && max_dna > 0 && j > 0 {
+        let prev_n = i > 0 && pam_is_n[i - 1];
+        let next_n = i < pattern.len() && pam_is_n[i];
+        if !prev_n && !next_n {
+            ops.push(EditOp::DnaBulge);
+            enumerate(
+                i, j - 1, ops,
+                cost + 1, mm, db + 1, rb,
+                dp, pattern, text,
+                max_edits, max_dna, max_rna, max_mm,
+                pam_is_n, results,
+            );
+            ops.pop();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

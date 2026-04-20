@@ -12,9 +12,55 @@ use std::thread::{self, JoinHandle};
 pub const KERNEL_CONTENTS: &str = include_str!("./kernel.cl");
 pub const KERNEL_MYERS_CONTENTS: &str = include_str!("./kernel_myers.cl");
 
-const SEARCH_CHUNK_SIZE: usize = 1 << 22; // must be less than 1<<32
-const SEARCH_CHUNK_SIZE_BYTES: usize = SEARCH_CHUNK_SIZE / 2;
-const CHUNKS_PER_SEARCH: usize = SEARCH_CHUNK_SIZE / CHUNK_SIZE;
+// Search chunk size (nucleotides per GPU batch) is chosen at runtime based on
+// available device memory — see [`init_search_chunk_nucl`]. The default below
+// is used only for CPU-only runs (no OpenCL device query).
+const DEFAULT_SEARCH_CHUNK_SIZE: usize = 1 << 22; // must be less than 1<<32
+const MAX_SEARCH_CHUNK_SIZE: usize = 1 << 30; // hard cap: 1 Gnt (<1<<32)
+
+static SEARCH_CHUNK_NUCL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_SEARCH_CHUNK_SIZE);
+
+#[inline]
+fn search_chunk_nucl() -> usize {
+    SEARCH_CHUNK_NUCL.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[inline]
+fn search_chunk_bytes() -> usize {
+    search_chunk_nucl() / 2
+}
+#[inline]
+fn chunks_per_search() -> usize {
+    search_chunk_nucl() / CHUNK_SIZE
+}
+
+/// Set the search chunk size based on the largest OpenCL device's memory budget.
+/// Picks ~1/4 of CL_DEVICE_MAX_MEM_ALLOC_SIZE per device (leaving room for the
+/// output/PEQ/PAM buffers), rounded down to a multiple of CHUNK_SIZE, and
+/// clamped to [DEFAULT_SEARCH_CHUNK_SIZE, MAX_SEARCH_CHUNK_SIZE].
+pub fn init_search_chunk_nucl_from_devices(devices: &OclRunConfig) {
+    let mut best_bytes: u64 = 0;
+    for (_, devs) in devices.get().iter() {
+        for d in devs {
+            if let Ok(alloc_bytes) = d.max_mem_alloc_size() {
+                if alloc_bytes > best_bytes {
+                    best_bytes = alloc_bytes;
+                }
+            }
+        }
+    }
+    if best_bytes == 0 {
+        // No devices (CPU-only run) — keep default.
+        return;
+    }
+    // Budget per genome buffer: 1/4 of max_alloc, bit4-packed (2 nucl/byte).
+    let budget_bytes = (best_bytes / 4) as usize;
+    let nucl_budget = budget_bytes.saturating_mul(2);
+    // Round down to CHUNK_SIZE multiple.
+    let mut size = (nucl_budget / CHUNK_SIZE) * CHUNK_SIZE;
+    size = size.clamp(DEFAULT_SEARCH_CHUNK_SIZE, MAX_SEARCH_CHUNK_SIZE);
+    SEARCH_CHUNK_NUCL.store(size, std::sync::atomic::Ordering::Relaxed);
+}
 
 const CPU_BLOCK_SIZE: usize = 8;
 const GPU_BLOCK_SIZE: usize = 4;
@@ -29,14 +75,14 @@ struct SearchChunkMeta {
 }
 
 struct SearchChunkInfo {
-    // fixed size data, divied into SEARCH_CHUNK_SIZE/CHUNK_SIZE chunks
-    pub data: Box<[u8; SEARCH_CHUNK_SIZE_BYTES]>,
+    // data length = search_chunk_bytes() (runtime-determined to fit GPU memory)
+    pub data: Box<[u8]>,
     pub meta: SearchChunkMeta,
 }
 struct SearchChunkResult {
     pub matches: Vec<SearchMatch>,
     pub meta: SearchChunkMeta,
-    pub data: Box<[u8; SEARCH_CHUNK_SIZE_BYTES]>,
+    pub data: Box<[u8]>,
 }
 
 #[repr(C)]
@@ -89,7 +135,7 @@ fn search_device_ocl(
         const CL_NO_BLOCK: u32 = 0;
         let queue = command_queue::CommandQueue::create(&context, dev.id(), 0)?;
         let kernel = kernel::Kernel::create(&program, "find_matches")?;
-        let mut genome_bufs = create_ocl_bufs::<u8>(&context, SEARCH_CHUNK_SIZE_BYTES)?;
+        let mut genome_bufs = create_ocl_bufs::<u8>(&context, search_chunk_bytes())?;
         let mut out_counts = create_ocl_bufs::<u32>(&context, 1)?;
         let mut out_bufs = create_ocl_bufs::<SearchMatch>(&context, OUT_BUF_SIZE)?;
         let mut pattern_buf = create_ocl_buf::<u8>(&context, patterns.len())?;
@@ -98,7 +144,7 @@ fn search_device_ocl(
         assert!(patterns.len() % pattern_blocked_size == 0);
         let n_patterns = patterns.len() / pattern_blocked_size;
         for item in recv.iter() {
-            let n_chunks = std::cmp::min(CHUNKS_PER_SEARCH - 1, item.meta.chr_names.len());
+            let n_chunks = std::cmp::min(chunks_per_search() - 1, item.meta.chr_names.len());
             let n_genome_bytes = n_chunks * CHUNK_SIZE_BYTES;
             let n_genome_blocks = n_genome_bytes / prefered_block_size(&dev)?;
             let n_genome_execs = n_genome_blocks / CL_BLOCKS_PER_EXEC;
@@ -249,7 +295,7 @@ fn search_chunk_cpu(
     max_mismatches: u32,
     pattern_len: usize,
     packed_patterns: &[u8],
-    data: &[u8; SEARCH_CHUNK_SIZE_BYTES],
+    data: &[u8],
 ) -> Vec<SearchMatch> {
     let mut matches: Vec<SearchMatch> = Vec::new();
     assert!(
@@ -379,7 +425,7 @@ struct SearchChunkResultMyers {
     pub matches: Vec<SearchMatch>,
     pub alignments: Vec<MyersAlignment>,
     pub meta: SearchChunkMeta,
-    pub data: Box<[u8; SEARCH_CHUNK_SIZE_BYTES]>,
+    pub data: Box<[u8]>,
 }
 
 fn nucl_idx_ascii(c: u8) -> u8 {
@@ -393,8 +439,10 @@ fn nucl_idx_ascii(c: u8) -> u8 {
 }
 
 /// Given a Myers candidate (alignment ending at `end_pos` in `ascii_chunk`),
-/// run traceback to classify edits and verify the PAM constraint.
-/// Returns Some((SearchMatch, MyersAlignment)) if the candidate is a valid match.
+/// enumerate every valid traceback. Returns one (SearchMatch, MyersAlignment)
+/// per distinct bulge placement / mismatch set that satisfies all per-type caps
+/// and the PAM constraint — matching original cas-offinder's behavior of
+/// emitting each alternative placement as its own hit.
 #[allow(clippy::too_many_arguments)]
 fn classify_myers_candidate(
     end_pos: usize,
@@ -407,106 +455,73 @@ fn classify_myers_candidate(
     max_dna_bulges: u32,
     max_rna_bulges: u32,
     text_window_len: usize,
-) -> Option<(SearchMatch, MyersAlignment)> {
-    use crate::traceback::{traceback, EditOp};
+) -> Vec<(SearchMatch, MyersAlignment)> {
+    use crate::traceback::{traceback_all, EditOp};
 
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
     let pattern = &patterns_ascii[pattern_idx];
     let is_n_pat = &pattern_is_n[pattern_idx];
     let eff_filter = &effective_filters_bit4[pattern_idx];
-    let pattern_len = pattern.len();
 
     let text_start_in_chunk = (end_pos + 1).saturating_sub(text_window_len);
     let text = &ascii_chunk[text_start_in_chunk..=end_pos];
 
-    let align = traceback(pattern, text, max_edits, max_dna_bulges, max_rna_bulges)?;
+    let alignments = traceback_all(
+        pattern,
+        text,
+        max_edits,
+        max_dna_bulges,
+        max_rna_bulges,
+        max_mismatches,
+        is_n_pat,
+    );
+    let mut out: Vec<(SearchMatch, MyersAlignment)> = Vec::with_capacity(alignments.len());
 
-    // Walk ops: classify edits and reject if any edit touches PAM region
-    let mut pattern_pos = 0usize;
-    let mut mismatches: u32 = 0;
-    let mut dna_bulges: u32 = 0;
-    let mut rna_bulges: u32 = 0;
-    for op in &align.ops {
-        match op {
-            EditOp::Match => {
-                pattern_pos += 1;
-            }
-            EditOp::Substitution => {
-                if is_n_pat[pattern_pos] {
-                    return None;
+    'alignments: for align in alignments {
+        // PAM check: for each pattern position that maps to a genome base,
+        // verify the effective filter matches. (traceback_all already pruned
+        // edits touching PAM positions, so mm/db/rb counts are valid.)
+        let genome_span: usize = align.text_aligned.iter().filter(|&&c| c != b'-').count();
+        let align_text_offset = text.len() - genome_span;
+        let mut p_in_pat = 0usize;
+        let mut g_off = align_text_offset;
+        for op in &align.ops {
+            match op {
+                EditOp::Match | EditOp::Substitution => {
+                    let genome_c = text[g_off];
+                    let g_bit4 = crate::bit4ops::char_to_bit4(genome_c);
+                    let f_bit4 = eff_filter[p_in_pat];
+                    if (g_bit4 & f_bit4) == 0 {
+                        continue 'alignments;
+                    }
+                    p_in_pat += 1;
+                    g_off += 1;
                 }
-                mismatches += 1;
-                pattern_pos += 1;
-            }
-            EditOp::RnaBulge => {
-                if is_n_pat[pattern_pos] {
-                    return None;
+                EditOp::DnaBulge => {
+                    g_off += 1;
                 }
-                rna_bulges += 1;
-                pattern_pos += 1;
-            }
-            EditOp::DnaBulge => {
-                let prev_n = pattern_pos > 0 && is_n_pat[pattern_pos - 1];
-                let next_n = pattern_pos < pattern_len && is_n_pat[pattern_pos];
-                if prev_n || next_n {
-                    return None;
+                EditOp::RnaBulge => {
+                    p_in_pat += 1;
                 }
-                dna_bulges += 1;
             }
         }
+
+        let match_start = end_pos + 1 - genome_span;
+        out.push((
+            SearchMatch {
+                chunk_idx: match_start as u32,
+                pattern_idx: pattern_idx as u32,
+                mismatches: align.mismatches,
+                dna_bulge_size: align.dna_bulges as u16,
+                rna_bulge_size: align.rna_bulges as u16,
+            },
+            MyersAlignment {
+                pattern_aligned: align.pattern_aligned,
+                text_aligned: align.text_aligned,
+            },
+        ));
     }
-    if mismatches > max_mismatches
-        || dna_bulges > max_dna_bulges
-        || rna_bulges > max_rna_bulges
-    {
-        return None;
-    }
-
-    // Compute genome span (non-gap chars in text alignment) and alignment offset
-    let genome_span: usize = align.text_aligned.iter().filter(|&&c| c != b'-').count();
-    // Semi-global: alignment covers text[text.len()-genome_span .. text.len()]
-    let align_text_offset = text.len() - genome_span;
-
-    // PAM check: for each pattern position that maps to a genome base,
-    // verify (genome_bit4 & effective_filter_bit4[p]) != 0.
-    let mut p_in_pat = 0usize;
-    let mut g_off = align_text_offset;
-    for op in &align.ops {
-        match op {
-            EditOp::Match | EditOp::Substitution => {
-                let genome_c = text[g_off];
-                let g_bit4 = crate::bit4ops::char_to_bit4(genome_c);
-                let f_bit4 = eff_filter[p_in_pat];
-                if (g_bit4 & f_bit4) == 0 {
-                    return None;
-                }
-                p_in_pat += 1;
-                g_off += 1;
-            }
-            EditOp::DnaBulge => {
-                g_off += 1;
-            }
-            EditOp::RnaBulge => {
-                p_in_pat += 1;
-            }
-        }
-    }
-
-    let match_start = end_pos + 1 - genome_span;
-
-    Some((
-        SearchMatch {
-            chunk_idx: match_start as u32,
-            pattern_idx: pattern_idx as u32,
-            mismatches,
-            dna_bulge_size: dna_bulges as u16,
-            rna_bulge_size: rna_bulges as u16,
-        },
-        MyersAlignment {
-            pattern_aligned: align.pattern_aligned,
-            text_aligned: align.text_aligned,
-        },
-    ))
+    out
 }
 
 /// Quick PAM pre-check: given an alignment ending at `end_pos` (inclusive),
@@ -589,11 +604,11 @@ fn search_chunk_myers(
     pattern_is_n: &[Vec<bool>],
     pam_precheck: &[(usize, Vec<u8>)],
     peqs: &[crate::myers::PeqTable],
-    chunk_data_bit4: &[u8; SEARCH_CHUNK_SIZE_BYTES],
+    chunk_data_bit4: &[u8],
     active_nucl: usize,
 ) -> (Vec<SearchMatch>, Vec<MyersAlignment>) {
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
-    let total_nucl = active_nucl.min(SEARCH_CHUNK_SIZE_BYTES * 2);
+    let total_nucl = active_nucl.min(chunk_data_bit4.len() * 2);
     let pattern_len = patterns_ascii[0].len();
     let text_window_len = pattern_len + max_dna_bulges as usize;
 
@@ -654,7 +669,7 @@ fn search_chunk_myers(
                 continue;
             }
 
-            if let Some((sm, al)) = classify_myers_candidate(
+            for (sm, al) in classify_myers_candidate(
                 t_pos,
                 p_idx,
                 &ascii_chunk,
@@ -816,16 +831,16 @@ unsafe fn search_device_ocl_myers(
     _dev: Arc<device::Device>,
     recv: crossbeam_channel::Receiver<SearchChunkInfo>,
     dest: mpsc::SyncSender<SearchChunkResultMyers>,
+    out_buf_size: usize,
 ) -> Result<()> {
-    const OUT_BUF_SIZE: usize = 1 << 22;
     const CL_BLOCK: u32 = 1;
     const CL_NO_BLOCK: u32 = 0;
 
     let queue = command_queue::CommandQueue::create(&context, _dev.id(), 0)?;
     let kernel = kernel::Kernel::create(&program, "find_matches_myers")?;
-    let mut genome_buf = create_ocl_buf::<u8>(&context, SEARCH_CHUNK_SIZE_BYTES)?;
+    let mut genome_buf = create_ocl_buf::<u8>(&context, search_chunk_bytes())?;
     let mut out_count = create_ocl_buf::<u32>(&context, 1)?;
-    let mut out_buf = create_ocl_buf::<SearchMatch>(&context, OUT_BUF_SIZE)?;
+    let mut out_buf = create_ocl_buf::<SearchMatch>(&context, out_buf_size)?;
     let mut peq_buf = create_ocl_buf::<u64>(&context, peq_array.len())?;
     let mut pam_off_buf = create_ocl_buf::<u8>(&context, pam_offsets_gpu.len())?;
     let mut pam_filt_buf = create_ocl_buf::<u8>(&context, pam_filters_flat_gpu.len())?;
@@ -838,10 +853,10 @@ unsafe fn search_device_ocl_myers(
     let text_window_len = pattern_len + max_dna_bulges as usize;
 
     for item in recv.iter() {
-        let n_chunks = std::cmp::min(CHUNKS_PER_SEARCH - 1, item.meta.chr_names.len());
+        let n_chunks = std::cmp::min(chunks_per_search() - 1, item.meta.chr_names.len());
         let n_active_nucl: u32 = (n_chunks * CHUNK_SIZE) as u32;
         let n_write_bytes = (n_chunks * CHUNK_SIZE_BYTES + CHUNK_SIZE_BYTES)
-            .min(SEARCH_CHUNK_SIZE_BYTES);
+            .min(search_chunk_bytes());
 
         let write_event = queue.enqueue_write_buffer(
             &mut genome_buf,
@@ -876,8 +891,15 @@ unsafe fn search_device_ocl_myers(
             &mut readsize_buf,
             &[kernel_event.get()],
         )?;
-        let readsize = readsize_buf[0] as usize;
-        let readsize = readsize.min(OUT_BUF_SIZE);
+        let total_found = readsize_buf[0] as usize;
+        if total_found > out_buf_size {
+            panic!(
+                "GPU match buffer overflow: {} candidates exceeds out_buf_size={}. \
+                 Reduce SEARCH_CHUNK_NUCL or increase the output buffer budget.",
+                total_found, out_buf_size
+            );
+        }
+        let readsize = total_found;
 
         if readsize == 0 {
             // Still forward an empty result so downstream matching stays in sync
@@ -903,38 +925,42 @@ unsafe fn search_device_ocl_myers(
         ];
         queue.enqueue_read_buffer(&out_buf, CL_BLOCK, 0, &mut raw_matches[..], &[])?;
 
-        // CPU post-process: decode chunk, run traceback + classification on each candidate
+        // CPU post-process: decode chunk, run traceback + classification on each candidate.
+        // Classify is O(pattern × text_window) per candidate with branchy DP, so running
+        // this single-threaded was the bottleneck that made the GPU path slower than CPU.
+        // rayon splits raw_matches across all cores, matching the CPU path's parallelism.
         let active_nucl = n_active_nucl as usize;
         let mut ascii_chunk = vec![0u8; active_nucl];
         crate::bit4_to_string(&mut ascii_chunk, &item.data[..], 0, active_nucl);
 
-        let mut final_matches: Vec<SearchMatch> = Vec::with_capacity(raw_matches.len());
-        let mut alignments: Vec<MyersAlignment> = Vec::with_capacity(raw_matches.len());
-        for raw in &raw_matches {
-            let end_pos = raw.chunk_idx as usize;
-            let p_idx = raw.pattern_idx as usize;
-            if end_pos >= active_nucl || p_idx >= patterns_ascii.len() {
-                continue;
-            }
-            if raw.mismatches > max_edits {
-                continue;
-            }
-            if let Some((sm, al)) = classify_myers_candidate(
-                end_pos,
-                p_idx,
-                &ascii_chunk,
-                &patterns_ascii,
-                &pattern_is_n,
-                &effective_filters_bit4,
-                max_mismatches,
-                max_dna_bulges,
-                max_rna_bulges,
-                text_window_len,
-            ) {
-                final_matches.push(sm);
-                alignments.push(al);
-            }
-        }
+        use rayon::prelude::*;
+        let classified: Vec<(SearchMatch, MyersAlignment)> = raw_matches
+            .par_iter()
+            .flat_map_iter(|raw| {
+                let end_pos = raw.chunk_idx as usize;
+                let p_idx = raw.pattern_idx as usize;
+                if end_pos >= active_nucl || p_idx >= patterns_ascii.len() {
+                    return Vec::new().into_iter();
+                }
+                if raw.mismatches > max_edits {
+                    return Vec::new().into_iter();
+                }
+                classify_myers_candidate(
+                    end_pos,
+                    p_idx,
+                    &ascii_chunk,
+                    &patterns_ascii,
+                    &pattern_is_n,
+                    &effective_filters_bit4,
+                    max_mismatches,
+                    max_dna_bulges,
+                    max_rna_bulges,
+                    text_window_len,
+                )
+                .into_iter()
+            })
+            .collect();
+        let (final_matches, alignments): (Vec<_>, Vec<_>) = classified.into_iter().unzip();
 
         dest.send(SearchChunkResultMyers {
             matches: final_matches,
@@ -1008,6 +1034,13 @@ fn search_chunk_ocl_myers(
     let pattern_len = patterns_ascii[0].len();
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
     let text_window = pattern_len + max_dna_bulges as usize;
+    // Match buffer sized to the search chunk: one candidate slot per 8
+    // genome nucleotides. With a typical PAM selectivity of ~1/16 this
+    // leaves ~2x headroom before the kernel's silent drop-on-overflow
+    // would kick in (we also panic on overflow below).
+    let out_buf_size: usize = (search_chunk_nucl() / 8)
+        .max(1 << 22)
+        .min(1 << 28);
     let compile_defs = format!(
         " -DPATTERN_LEN={} -DPAM_LEN={} -DMAX_EDITS={} -DMAX_DNA_BULGES={} -DTEXT_WINDOW={} -DOUT_BUF_SIZE={}",
         pattern_len,
@@ -1015,7 +1048,7 @@ fn search_chunk_ocl_myers(
         max_edits,
         max_dna_bulges,
         text_window,
-        1u32 << 22,
+        out_buf_size,
     );
 
     let mut threads: Vec<JoinHandle<Result<()>>> = Vec::new();
@@ -1070,6 +1103,7 @@ fn search_chunk_ocl_myers(
                         p_dev,
                         t_recv,
                         t_dest,
+                        out_buf_size,
                     )
                 }));
             }
@@ -1093,7 +1127,7 @@ fn convert_matches_myers(
         let idx = chunk_pos / CHUNK_SIZE;
         let offset = chunk_pos % CHUNK_SIZE;
         let pos = search_res.meta.chunk_starts[idx] + offset as u64;
-        let is_last_chunk = idx == CHUNKS_PER_SEARCH - 1;
+        let is_last_chunk = idx == chunks_per_search() - 1;
         let is_end_chrom = idx == search_res.meta.chr_names.len() - 1
             || search_res.meta.chunk_starts[idx + 1] == 0;
         let is_past_end = pos + pattern_len as u64 > search_res.meta.chunk_ends[idx];
@@ -1126,11 +1160,13 @@ fn convert_matches_myers(
 }
 
 fn chunks_to_searchchunk(chunk_buf: &[ChromChunkInfo]) -> SearchChunkInfo {
-    let mut search_buf = Box::new([0_u8; SEARCH_CHUNK_SIZE_BYTES]);
-    let mut names: Vec<String> = Vec::with_capacity(CHUNKS_PER_SEARCH);
-    let mut starts: Vec<u64> = Vec::with_capacity(CHUNKS_PER_SEARCH);
-    let mut ends: Vec<u64> = Vec::with_capacity(CHUNKS_PER_SEARCH);
-    // only takes  CHUNKS_PER_SEARCH-1 chunks because you don't want to leave any hanging data on the end
+    // Runtime-sized buffer; holds chunks_per_search() CHUNK_SIZE_BYTES chunks.
+    let cps = chunks_per_search();
+    let mut search_buf: Box<[u8]> = vec![0_u8; search_chunk_bytes()].into_boxed_slice();
+    let mut names: Vec<String> = Vec::with_capacity(cps);
+    let mut starts: Vec<u64> = Vec::with_capacity(cps);
+    let mut ends: Vec<u64> = Vec::with_capacity(cps);
+    // only takes  chunks_per_search()-1 chunks because you don't want to leave any hanging data on the end
     for (idx, chunk) in chunk_buf.iter().enumerate() {
         assert!(
             idx == 0 || *ends.last().unwrap() == chunk.chunk_start || chunk.chunk_start == 0,
@@ -1166,7 +1202,7 @@ fn convert_matches(
         let offset = smatch.chunk_idx as usize % CHUNK_SIZE;
         let pos = search_res.meta.chunk_starts[idx] + offset as u64;
         //skip anything in the last chunk, it will be repeated again in the next search item
-        let is_last_chunk = idx == CHUNKS_PER_SEARCH - 1;
+        let is_last_chunk = idx == chunks_per_search() - 1;
         let is_end_chrom = idx == search_res.meta.chr_names.len() - 1
             || search_res.meta.chunk_starts[idx + 1] == 0;
         let is_past_end = pos + pattern_len as u64 > search_res.meta.chunk_ends[idx];
@@ -1225,6 +1261,10 @@ pub fn search(
     );
     assert!(patterns_ascii[0].len() == pattern_len);
 
+    // Size the search chunk to the GPU's max single-alloc budget (once per
+    // process, before any SearchChunkInfo is built). CPU-only runs keep default.
+    init_search_chunk_nucl_from_devices(&devices);
+
     let use_myers = max_dna_bulges > 0 || max_rna_bulges > 0;
 
     // Convert patterns to bit4 for GPU / legacy CPU path
@@ -1242,16 +1282,17 @@ pub fn search(
         crossbeam_channel::Receiver<SearchChunkInfo>,
     ) = crossbeam_channel::bounded(4);
 
+    let cps_outer = chunks_per_search();
     let send_thread = thread::Builder::new()
-        .stack_size(SEARCH_CHUNK_SIZE_BYTES * 2)
+        .stack_size(search_chunk_bytes() * 2)
         .spawn(move || {
-            let mut buf: Vec<ChromChunkInfo> = Vec::with_capacity(CHUNKS_PER_SEARCH);
+            let mut buf: Vec<ChromChunkInfo> = Vec::with_capacity(cps_outer);
             loop {
                 let res = recv.recv();
                 match res {
                     Ok(chunk) => {
                         buf.push(chunk);
-                        if buf.len() == CHUNKS_PER_SEARCH {
+                        if buf.len() == cps_outer {
                             compute_send_src.send(chunks_to_searchchunk(&buf)).unwrap();
                             let last_el = buf.pop().unwrap();
                             buf.clear();

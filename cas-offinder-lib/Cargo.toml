@@ -8,5 +8,6 @@ authors = ["Ben Black <benblack769@gmail.com>", "Jeongbin Park <jeongbin.park@pu
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-opencl3 = "0.9.4" 
+opencl3 = "0.9.4"
 crossbeam-channel = "0.5.8"
+rayon = "1.10"
