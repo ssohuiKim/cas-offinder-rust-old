@@ -95,6 +95,87 @@ struct SearchMatch {
     pub rna_bulge_size: u16,
 }
 
+/// GPU-side output of the Myers+DP+traceback kernel. Each record carries
+/// the aligned ops packed as 2 bits per op (LSB = first op emitted during
+/// walk-back, i.e. the last op in alignment order). Host walks ops in
+/// reverse to rebuild pattern_aligned / text_aligned strings without a DP.
+/// Layout (32 B, natural u64-aligned):
+///   u32 chunk_idx        -> match_start on genome
+///   u32 pattern_idx
+///   u64 ops_packed
+///   u32 mismatches
+///   u16 dna_bulge_size
+///   u16 rna_bulge_size
+///   u32 ops_count
+///   u32 _pad
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct GpuEnumMatch {
+    pub chunk_idx: u32,
+    pub pattern_idx: u32,
+    pub ops_packed: u64,
+    pub mismatches: u32,
+    pub dna_bulge_size: u16,
+    pub rna_bulge_size: u16,
+    pub ops_count: u32,
+    pub _pad: u32,
+}
+
+const GPU_OP_MATCH: u8 = 0;
+const GPU_OP_SUB: u8 = 1;
+const GPU_OP_DNA: u8 = 2;
+const GPU_OP_RNA: u8 = 3;
+
+/// Decode a [`GpuEnumMatch`] into a (SearchMatch, MyersAlignment) pair by
+/// walking the packed ops (in reverse of traceback order = forward alignment
+/// order) and pulling the corresponding characters from pattern + genome.
+fn decode_gpu_enum_match(
+    raw: &GpuEnumMatch,
+    ascii_chunk: &[u8],
+    pattern_ascii: &[u8],
+) -> (SearchMatch, MyersAlignment) {
+    let ops_count = raw.ops_count as usize;
+    let mut pattern_aligned: Vec<u8> = Vec::with_capacity(ops_count);
+    let mut text_aligned: Vec<u8> = Vec::with_capacity(ops_count);
+    let mut pi: usize = 0;
+    let mut gi: usize = raw.chunk_idx as usize;
+    for k_rev in (0..ops_count).rev() {
+        let op = ((raw.ops_packed >> (k_rev * 2)) & 0x3) as u8;
+        match op {
+            GPU_OP_MATCH | GPU_OP_SUB => {
+                pattern_aligned.push(pattern_ascii[pi]);
+                text_aligned.push(ascii_chunk[gi]);
+                pi += 1;
+                gi += 1;
+            }
+            GPU_OP_DNA => {
+                pattern_aligned.push(b'-');
+                text_aligned.push(ascii_chunk[gi]);
+                gi += 1;
+            }
+            GPU_OP_RNA => {
+                pattern_aligned.push(pattern_ascii[pi]);
+                text_aligned.push(b'-');
+                pi += 1;
+            }
+            _ => unreachable!("invalid op code {}", op),
+        }
+    }
+    (
+        SearchMatch {
+            chunk_idx: raw.chunk_idx,
+            pattern_idx: raw.pattern_idx,
+            mismatches: raw.mismatches,
+            dna_bulge_size: raw.dna_bulge_size,
+            rna_bulge_size: raw.rna_bulge_size,
+        },
+        MyersAlignment {
+            pattern_aligned,
+            text_aligned,
+        },
+    )
+}
+
 const MAX_QUEUED: usize = 1;
 unsafe fn create_ocl_buf<T>(context: &context::Context, size: usize) -> Result<memory::Buffer<T>> {
     memory::Buffer::create(context, memory::CL_MEM_READ_WRITE, size, null_mut())
@@ -815,17 +896,16 @@ fn build_peq_array(peqs: &[crate::myers::PeqTable]) -> Vec<u64> {
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn search_device_ocl_myers(
-    max_mismatches: u32,
-    max_dna_bulges: u32,
-    max_rna_bulges: u32,
+    _max_mismatches: u32,
+    _max_dna_bulges: u32,
+    _max_rna_bulges: u32,
     peq_array: Arc<Vec<u64>>,
+    pattern_bit4_flat: Arc<Vec<u8>>,
     pam_offsets_gpu: Arc<Vec<u8>>,
     pam_filters_flat_gpu: Arc<Vec<u8>>,
     n_patterns: u32,
-    n_fwd_patterns: u32,
+    _n_fwd_patterns: u32,
     patterns_ascii: Arc<Vec<Vec<u8>>>,
-    pattern_is_n: Arc<Vec<Vec<bool>>>,
-    effective_filters_bit4: Arc<Vec<Vec<u8>>>,
     context: Arc<context::Context>,
     program: Arc<program::Program>,
     _dev: Arc<device::Device>,
@@ -840,17 +920,15 @@ unsafe fn search_device_ocl_myers(
     let kernel = kernel::Kernel::create(&program, "find_matches_myers")?;
     let mut genome_buf = create_ocl_buf::<u8>(&context, search_chunk_bytes())?;
     let mut out_count = create_ocl_buf::<u32>(&context, 1)?;
-    let mut out_buf = create_ocl_buf::<SearchMatch>(&context, out_buf_size)?;
+    let mut out_buf = create_ocl_buf::<GpuEnumMatch>(&context, out_buf_size)?;
     let mut peq_buf = create_ocl_buf::<u64>(&context, peq_array.len())?;
+    let mut pattern_buf = create_ocl_buf::<u8>(&context, pattern_bit4_flat.len())?;
     let mut pam_off_buf = create_ocl_buf::<u8>(&context, pam_offsets_gpu.len())?;
     let mut pam_filt_buf = create_ocl_buf::<u8>(&context, pam_filters_flat_gpu.len())?;
     queue.enqueue_write_buffer(&mut peq_buf, CL_BLOCK, 0, &peq_array, &[])?;
+    queue.enqueue_write_buffer(&mut pattern_buf, CL_BLOCK, 0, &pattern_bit4_flat, &[])?;
     queue.enqueue_write_buffer(&mut pam_off_buf, CL_BLOCK, 0, &pam_offsets_gpu, &[])?;
     queue.enqueue_write_buffer(&mut pam_filt_buf, CL_BLOCK, 0, &pam_filters_flat_gpu, &[])?;
-
-    let pattern_len = patterns_ascii[0].len();
-    let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
-    let text_window_len = pattern_len + max_dna_bulges as usize;
 
     for item in recv.iter() {
         let n_chunks = std::cmp::min(chunks_per_search() - 1, item.meta.chr_names.len());
@@ -871,10 +949,11 @@ unsafe fn search_device_ocl_myers(
         let kernel_event = kernel::ExecuteKernel::new(&kernel)
             .set_arg(&genome_buf)
             .set_arg(&peq_buf)
+            .set_arg(&pattern_buf)
             .set_arg(&pam_off_buf)
             .set_arg(&pam_filt_buf)
             .set_arg(&n_patterns)
-            .set_arg(&n_fwd_patterns)
+            .set_arg(&_n_fwd_patterns)
             .set_arg(&n_active_nucl)
             .set_arg(&out_buf)
             .set_arg(&out_count)
@@ -902,7 +981,6 @@ unsafe fn search_device_ocl_myers(
         let readsize = total_found;
 
         if readsize == 0 {
-            // Still forward an empty result so downstream matching stays in sync
             dest.send(SearchChunkResultMyers {
                 matches: Vec::new(),
                 alignments: Vec::new(),
@@ -913,54 +991,26 @@ unsafe fn search_device_ocl_myers(
             continue;
         }
 
-        let mut raw_matches: Vec<SearchMatch> = vec![
-            SearchMatch {
-                chunk_idx: 0,
-                pattern_idx: 0,
-                mismatches: 0,
-                dna_bulge_size: 0,
-                rna_bulge_size: 0,
-            };
-            readsize
-        ];
+        let mut raw_matches: Vec<GpuEnumMatch> =
+            vec![GpuEnumMatch::default(); readsize];
         queue.enqueue_read_buffer(&out_buf, CL_BLOCK, 0, &mut raw_matches[..], &[])?;
 
-        // CPU post-process: decode chunk, run traceback + classification on each candidate.
-        // Classify is O(pattern × text_window) per candidate with branchy DP, so running
-        // this single-threaded was the bottleneck that made the GPU path slower than CPU.
-        // rayon splits raw_matches across all cores, matching the CPU path's parallelism.
+        // Host post-process: decode packed ops into aligned strings using
+        // pattern_ascii + genome ASCII. No DP — just bit unpacking and
+        // char gather. rayon parallelizes across cores.
         let active_nucl = n_active_nucl as usize;
         let mut ascii_chunk = vec![0u8; active_nucl];
         crate::bit4_to_string(&mut ascii_chunk, &item.data[..], 0, active_nucl);
 
         use rayon::prelude::*;
-        let classified: Vec<(SearchMatch, MyersAlignment)> = raw_matches
+        let decoded: Vec<(SearchMatch, MyersAlignment)> = raw_matches
             .par_iter()
-            .flat_map_iter(|raw| {
-                let end_pos = raw.chunk_idx as usize;
-                let p_idx = raw.pattern_idx as usize;
-                if end_pos >= active_nucl || p_idx >= patterns_ascii.len() {
-                    return Vec::new().into_iter();
-                }
-                if raw.mismatches > max_edits {
-                    return Vec::new().into_iter();
-                }
-                classify_myers_candidate(
-                    end_pos,
-                    p_idx,
-                    &ascii_chunk,
-                    &patterns_ascii,
-                    &pattern_is_n,
-                    &effective_filters_bit4,
-                    max_mismatches,
-                    max_dna_bulges,
-                    max_rna_bulges,
-                    text_window_len,
-                )
-                .into_iter()
+            .map(|raw| {
+                let pattern_ascii = &patterns_ascii[raw.pattern_idx as usize];
+                decode_gpu_enum_match(raw, &ascii_chunk, pattern_ascii)
             })
             .collect();
-        let (final_matches, alignments): (Vec<_>, Vec<_>) = classified.into_iter().unzip();
+        let (final_matches, alignments): (Vec<_>, Vec<_>) = decoded.into_iter().unzip();
 
         dest.send(SearchChunkResultMyers {
             matches: final_matches,
@@ -1026,12 +1076,23 @@ fn search_chunk_ocl_myers(
     let pam_off_arc = Arc::new(pam_offsets_gpu);
     let pam_filt_arc = Arc::new(pam_filters_flat_gpu);
     let patterns_arc = Arc::new(patterns_ascii.to_vec());
-    let is_n_arc = Arc::new(pattern_is_n);
-    let filters_arc = Arc::new(effective_filters_bit4);
     let n_patterns = patterns_ascii.len() as u32;
     let n_fwd_patterns = n_original_patterns as u32;
 
     let pattern_len = patterns_ascii[0].len();
+    let pattern_bytes = (pattern_len + 1) / 2;
+    // Flatten patterns to bit4-packed form for the kernel.
+    let mut pattern_bit4_flat: Vec<u8> = vec![0u8; pattern_bytes * patterns_ascii.len()];
+    for (p_idx, pat) in patterns_ascii.iter().enumerate() {
+        crate::string_to_bit4(
+            &mut pattern_bit4_flat[p_idx * pattern_bytes..(p_idx + 1) * pattern_bytes],
+            pat,
+            0,
+            true,
+        );
+    }
+    let pattern_bit4_arc = Arc::new(pattern_bit4_flat);
+
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
     let text_window = pattern_len + max_dna_bulges as usize;
     // Match buffer sized to the search chunk: one candidate slot per 8
@@ -1042,11 +1103,13 @@ fn search_chunk_ocl_myers(
         .max(1 << 22)
         .min(1 << 28);
     let compile_defs = format!(
-        " -DPATTERN_LEN={} -DPAM_LEN={} -DMAX_EDITS={} -DMAX_DNA_BULGES={} -DTEXT_WINDOW={} -DOUT_BUF_SIZE={}",
+        " -DPATTERN_LEN={} -DPAM_LEN={} -DMAX_EDITS={} -DMAX_MISMATCHES={} -DMAX_DNA_BULGES={} -DMAX_RNA_BULGES={} -DTEXT_WINDOW={} -DOUT_BUF_SIZE={}",
         pattern_len,
         pam_len,
         max_edits,
+        max_mismatches,
         max_dna_bulges,
+        max_rna_bulges,
         text_window,
         out_buf_size,
     );
@@ -1080,24 +1143,22 @@ fn search_chunk_ocl_myers(
                 let t_context = context.clone();
                 let t_prog = program.clone();
                 let t_peq = peq_array.clone();
+                let t_pat_b4 = pattern_bit4_arc.clone();
                 let t_pam_off = pam_off_arc.clone();
                 let t_pam_filt = pam_filt_arc.clone();
                 let t_pat = patterns_arc.clone();
-                let t_isn = is_n_arc.clone();
-                let t_filt = filters_arc.clone();
                 threads.push(thread::spawn(move || unsafe {
                     search_device_ocl_myers(
                         max_mismatches,
                         max_dna_bulges,
                         max_rna_bulges,
                         t_peq,
+                        t_pat_b4,
                         t_pam_off,
                         t_pam_filt,
                         n_patterns,
                         n_fwd_patterns,
                         t_pat,
-                        t_isn,
-                        t_filt,
                         t_context,
                         t_prog,
                         p_dev,
