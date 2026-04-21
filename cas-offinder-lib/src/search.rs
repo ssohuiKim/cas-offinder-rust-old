@@ -1260,16 +1260,12 @@ fn search_chunk_ocl_myers(
 fn convert_matches_myers(
     patterns_ascii: &[Vec<u8>],
     pattern_len: usize,
-    max_dna_bulges: u32,
+    _max_dna_bulges: u32,
     search_res: SearchChunkResultMyers,
 ) -> Vec<Match> {
     let n_orig = patterns_ascii.len() / 2;
     let mut results: Vec<Match> = Vec::new();
     let n_chunks = search_res.meta.chr_names.len();
-    // Max text extent of a candidate = pattern_len + max_dna_bulges. Needed
-    // for the end-of-chromosome check so a bulge match can't leak its tail
-    // past the chromosome boundary.
-    let max_text_extent = pattern_len as u64 + max_dna_bulges as u64;
     for (smatch, align) in search_res.matches.iter().zip(search_res.alignments.iter()) {
         // chunk_idx is the nucleotide index within the tight-packed search buffer;
         // locate its owning chunk via binary search on chunk_byte_offsets (byte units).
@@ -1286,7 +1282,13 @@ fn convert_matches_myers(
         let is_last_chunk = search_res.meta.has_overlap_tail && idx == n_chunks - 1;
         let is_end_chrom = idx == n_chunks - 1
             || search_res.meta.chunk_starts[idx + 1] == 0;
-        let is_past_end = pos + max_text_extent > search_res.meta.chunk_ends[idx];
+        // Use this match's actual genome span (pattern_len + dna_bulges - rna_bulges)
+        // instead of the worst-case upper bound — otherwise short alignments near
+        // a chromosome tail get rejected even when they fit entirely within it.
+        let actual_extent = (pattern_len as u64)
+            + (smatch.dna_bulge_size as u64)
+            - (smatch.rna_bulge_size as u64);
+        let is_past_end = pos + actual_extent > search_res.meta.chunk_ends[idx];
         if is_last_chunk || (is_end_chrom && is_past_end) {
             continue;
         }
