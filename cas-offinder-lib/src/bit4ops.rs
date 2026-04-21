@@ -275,6 +275,25 @@ pub fn char_to_bit4(c: u8) -> u8 {
     STR_2_BIT4[true as usize][c as usize]
 }
 
+/// Read the bit4 nucleotide at nucleotide index `i` from a packed buffer.
+/// Two nucleotides per byte: even index in the low nibble, odd in the high.
+#[inline(always)]
+pub fn get_bit4(data: &[u8], i: usize) -> u8 {
+    let byte = data[i / 2];
+    if i % 2 == 0 {
+        byte & 0x0F
+    } else {
+        (byte >> 4) & 0x0F
+    }
+}
+
+/// Inverse of `char_to_bit4`: map a 4-bit code back to an ASCII character
+/// (uppercase IUPAC if mixed-base, else 'N'/'0' for invalid).
+#[inline(always)]
+pub fn bit4_to_char(b: u8) -> u8 {
+    BIT4_TO_STR[(b & 0x0F) as usize]
+}
+
 #[cfg(test)]
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.

@@ -155,9 +155,10 @@ const GPU_OP_RNA: u8 = 3;
 /// here.
 fn decode_gpu_enum_match(
     raw: &GpuEnumMatch,
-    ascii_chunk: &[u8],
+    genome_bit4: &[u8],
     pattern_ascii: &[u8],
 ) -> Option<(SearchMatch, MyersAlignment)> {
+    use crate::bit4ops::{bit4_to_char, get_bit4};
     let ops_count = raw.ops_count as usize;
     let mut pattern_aligned: Vec<u8> = Vec::with_capacity(ops_count);
     let mut text_aligned: Vec<u8> = Vec::with_capacity(ops_count);
@@ -167,22 +168,22 @@ fn decode_gpu_enum_match(
         let op = ((raw.ops_packed >> (k_rev * 2)) & 0x3) as u8;
         match op {
             GPU_OP_MATCH | GPU_OP_SUB => {
-                let ch = ascii_chunk[gi];
-                if ch == 0 {
+                let b4 = get_bit4(genome_bit4, gi);
+                if b4 == 0 {
                     return None;
                 }
                 pattern_aligned.push(pattern_ascii[pi]);
-                text_aligned.push(ch);
+                text_aligned.push(bit4_to_char(b4));
                 pi += 1;
                 gi += 1;
             }
             GPU_OP_DNA => {
-                let ch = ascii_chunk[gi];
-                if ch == 0 {
+                let b4 = get_bit4(genome_bit4, gi);
+                if b4 == 0 {
                     return None;
                 }
                 pattern_aligned.push(b'-');
-                text_aligned.push(ch);
+                text_aligned.push(bit4_to_char(b4));
                 gi += 1;
             }
             GPU_OP_RNA => {
@@ -558,17 +559,20 @@ fn nucl_idx_ascii(c: u8) -> u8 {
     }
 }
 
-/// Given a Myers candidate (alignment ending at `end_pos` in `ascii_chunk`),
-/// enumerate every valid traceback. Returns one (SearchMatch, MyersAlignment)
-/// per distinct bulge placement / mismatch set that satisfies all per-type caps
-/// and the PAM constraint — matching original cas-offinder's behavior of
-/// emitting each alternative placement as its own hit.
+/// Given a Myers candidate (alignment ending at `end_pos` in the bit4 genome
+/// buffer), enumerate every valid traceback. Returns one (SearchMatch,
+/// MyersAlignment) per distinct bulge placement / mismatch set that satisfies
+/// all per-type caps and the PAM constraint — matching original cas-offinder's
+/// behavior of emitting each alternative placement as its own hit.
+///
+/// Works on bit4 throughout: pattern and text windows are bit4, so the DP and
+/// PAM checks compare with `(a & b) != 0` directly (no ASCII round-trip).
 #[allow(clippy::too_many_arguments)]
 fn classify_myers_candidate(
     end_pos: usize,
     pattern_idx: usize,
-    ascii_chunk: &[u8],
-    patterns_ascii: &[Vec<u8>],
+    genome_bit4: &[u8],
+    patterns_bit4: &[Vec<u8>],
     pattern_is_n: &[Vec<bool>],
     effective_filters_bit4: &[Vec<u8>],
     max_mismatches: u32,
@@ -576,19 +580,23 @@ fn classify_myers_candidate(
     max_rna_bulges: u32,
     text_window_len: usize,
 ) -> Vec<(SearchMatch, MyersAlignment)> {
+    use crate::bit4ops::get_bit4;
     use crate::traceback::{traceback_all, EditOp};
 
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
-    let pattern = &patterns_ascii[pattern_idx];
+    let pattern_bit4 = &patterns_bit4[pattern_idx];
     let is_n_pat = &pattern_is_n[pattern_idx];
     let eff_filter = &effective_filters_bit4[pattern_idx];
 
     let text_start_in_chunk = (end_pos + 1).saturating_sub(text_window_len);
-    let text = &ascii_chunk[text_start_in_chunk..=end_pos];
+    let text_len = end_pos + 1 - text_start_in_chunk;
+    let text_bit4: Vec<u8> = (text_start_in_chunk..=end_pos)
+        .map(|i| get_bit4(genome_bit4, i))
+        .collect();
 
     let alignments = traceback_all(
-        pattern,
-        text,
+        pattern_bit4,
+        &text_bit4,
         max_edits,
         max_dna_bulges,
         max_rna_bulges,
@@ -599,17 +607,16 @@ fn classify_myers_candidate(
 
     'alignments: for align in alignments {
         // PAM check: for each pattern position that maps to a genome base,
-        // verify the effective filter matches. (traceback_all already pruned
-        // edits touching PAM positions, so mm/db/rb counts are valid.)
+        // verify the effective filter matches. Walk ops forward, pulling bit4
+        // directly from the packed genome buffer.
         let genome_span: usize = align.text_aligned.iter().filter(|&&c| c != b'-').count();
-        let align_text_offset = text.len() - genome_span;
+        let align_text_offset = text_len - genome_span;
         let mut p_in_pat = 0usize;
         let mut g_off = align_text_offset;
         for op in &align.ops {
             match op {
                 EditOp::Match | EditOp::Substitution => {
-                    let genome_c = text[g_off];
-                    let g_bit4 = crate::bit4ops::char_to_bit4(genome_c);
+                    let g_bit4 = get_bit4(genome_bit4, text_start_in_chunk + g_off);
                     let f_bit4 = eff_filter[p_in_pat];
                     if (g_bit4 & f_bit4) == 0 {
                         continue 'alignments;
@@ -656,7 +663,8 @@ fn classify_myers_candidate(
 /// [0, max_dna_bulges] and accept if any shift yields a valid PAM.
 /// For PAM-last patterns, PAM is anchored to end_pos and unaffected by bulges.
 fn check_pam_quick(
-    ascii_chunk: &[u8],
+    genome_bit4: &[u8],
+    total_nucl: usize,
     end_pos: usize,
     pattern_len: usize,
     pam_offset: usize,
@@ -676,11 +684,11 @@ fn check_pam_quick(
         let mut ok = true;
         for (k, &f) in pam_filter.iter().enumerate() {
             let gpos = align_start + pam_offset + k;
-            if gpos >= ascii_chunk.len() {
+            if gpos >= total_nucl {
                 ok = false;
                 break;
             }
-            let g = crate::bit4ops::char_to_bit4(ascii_chunk[gpos]);
+            let g = crate::bit4ops::get_bit4(genome_bit4, gpos);
             if (g & f) == 0 {
                 ok = false;
                 break;
@@ -719,7 +727,8 @@ fn search_chunk_myers(
     max_mismatches: u32,
     max_dna_bulges: u32,
     max_rna_bulges: u32,
-    patterns_ascii: &[Vec<u8>],
+    patterns_bit4: &[Vec<u8>],
+    pattern_len: usize,
     effective_filters_bit4: &[Vec<u8>],
     pattern_is_n: &[Vec<bool>],
     pam_precheck: &[(usize, Vec<u8>)],
@@ -728,14 +737,11 @@ fn search_chunk_myers(
     active_start_nucl: usize,
     active_end_nucl: usize,
 ) -> (Vec<SearchMatch>, Vec<MyersAlignment>) {
+    use crate::bit4ops::get_bit4;
+
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
     let total_nucl = active_end_nucl.min(chunk_data_bit4.len() * 2);
-    let pattern_len = patterns_ascii[0].len();
     let text_window_len = pattern_len + max_dna_bulges as usize;
-
-    // Decode only the active (non-padding) region to ASCII
-    let mut ascii_chunk = vec![0u8; total_nucl];
-    crate::bit4_to_string(&mut ascii_chunk, chunk_data_bit4, 0, total_nucl);
 
     let mut matches: Vec<SearchMatch> = Vec::new();
     let mut alignments: Vec<MyersAlignment> = Vec::new();
@@ -747,17 +753,10 @@ fn search_chunk_myers(
     };
     let last_bit = 1u64 << (pattern_len - 1);
 
-    // Per-position windowed Myers on BIT4, byte-for-byte the same operation
-    // as the GPU kernel. CPU and GPU now consume the same encoding (no lossy
-    // ASCII round-trip) and produce identical candidate sets.
-    let get_bit4 = |i: usize| -> u8 {
-        let byte = chunk_data_bit4[i / 2];
-        if i % 2 == 0 {
-            byte & 0x0F
-        } else {
-            (byte >> 4) & 0x0F
-        }
-    };
+    // Per-position windowed Myers on BIT4 end-to-end — no ASCII round-trip.
+    // PAM pre-check, Myers sweep, and classify all read nibbles directly from
+    // the packed genome buffer via `get_bit4`. This matches the GPU kernel
+    // byte-for-byte so CPU/GPU enumerate the same candidate set.
     for (p_idx, peq) in peqs.iter().enumerate() {
         let (pam_offset, ref pam_filter) = pam_precheck[p_idx];
 
@@ -767,7 +766,15 @@ fn search_chunk_myers(
             }
 
             // PAM pre-check first (cheap fail-fast, same order as kernel)
-            if !check_pam_quick(&ascii_chunk, t_pos, pattern_len, pam_offset, pam_filter, max_dna_bulges) {
+            if !check_pam_quick(
+                chunk_data_bit4,
+                total_nucl,
+                t_pos,
+                pattern_len,
+                pam_offset,
+                pam_filter,
+                max_dna_bulges,
+            ) {
                 continue;
             }
 
@@ -778,7 +785,7 @@ fn search_chunk_myers(
             let mut vn: u64 = 0;
             let mut score: i32 = pattern_len as i32;
             for t in text_start..=t_pos {
-                let b4 = get_bit4(t);
+                let b4 = get_bit4(chunk_data_bit4, t);
                 let mut eq: u64 = 0;
                 if b4 & 0x4 != 0 { eq |= peq.peq[0]; } // A
                 if b4 & 0x2 != 0 { eq |= peq.peq[1]; } // C
@@ -807,8 +814,8 @@ fn search_chunk_myers(
             for (sm, al) in classify_myers_candidate(
                 t_pos,
                 p_idx,
-                &ascii_chunk,
-                patterns_ascii,
+                chunk_data_bit4,
+                patterns_bit4,
                 pattern_is_n,
                 effective_filters_bit4,
                 max_mismatches,
@@ -828,7 +835,8 @@ fn search_device_cpu_thread_myers(
     max_mismatches: u32,
     max_dna_bulges: u32,
     max_rna_bulges: u32,
-    patterns_ascii: Arc<Vec<Vec<u8>>>,
+    patterns_bit4: Arc<Vec<Vec<u8>>>,
+    pattern_len: usize,
     effective_filters_bit4: Arc<Vec<Vec<u8>>>,
     pattern_is_n: Arc<Vec<Vec<bool>>>,
     pam_precheck: Arc<Vec<(usize, Vec<u8>)>>,
@@ -856,7 +864,8 @@ fn search_device_cpu_thread_myers(
             max_mismatches,
             max_dna_bulges,
             max_rna_bulges,
-            &patterns_ascii,
+            &patterns_bit4,
+            pattern_len,
             &effective_filters_bit4,
             &pattern_is_n,
             &pam_precheck,
@@ -911,16 +920,25 @@ fn search_compute_cpu_myers(
 
     let pam_precheck = precompute_pam_precheck(&pattern_is_n, &effective_filters_bit4);
 
+    // Per-character bit4 patterns (one nibble per nucleotide, length =
+    // pattern_len). The CPU DP + PAM verification read these directly,
+    // avoiding any ASCII round-trip.
+    let pattern_len = patterns_ascii[0].len();
+    let patterns_bit4: Vec<Vec<u8>> = patterns_ascii
+        .iter()
+        .map(|p| p.iter().map(|&c| char_to_bit4(c)).collect())
+        .collect();
+
     let peqs_arc = Arc::new(peqs);
     let is_n_arc = Arc::new(pattern_is_n);
     let filters_arc = Arc::new(effective_filters_bit4);
     let pam_arc = Arc::new(pam_precheck);
-    let patterns_arc = Arc::new(patterns_ascii.to_vec());
+    let patterns_b4_arc = Arc::new(patterns_bit4);
 
     let n_threads: usize = thread::available_parallelism().unwrap().into();
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::new();
     for _ in 0..n_threads {
-        let t_pat = patterns_arc.clone();
+        let t_pat = patterns_b4_arc.clone();
         let t_filt = filters_arc.clone();
         let t_isn = is_n_arc.clone();
         let t_pam = pam_arc.clone();
@@ -933,6 +951,7 @@ fn search_compute_cpu_myers(
                 max_dna_bulges,
                 max_rna_bulges,
                 t_pat,
+                pattern_len,
                 t_filt,
                 t_isn,
                 t_pam,
@@ -1076,19 +1095,16 @@ unsafe fn search_device_ocl_myers(
             vec![GpuEnumMatch::default(); readsize];
         queue.enqueue_read_buffer(&out_buf, CL_BLOCK, 0, &mut raw_matches[..], &[])?;
 
-        // Host post-process: decode packed ops into aligned strings using
-        // pattern_ascii + genome ASCII. No DP — just bit unpacking and
-        // char gather. rayon parallelizes across cores.
-        let active_nucl = n_active_nucl as usize;
-        let mut ascii_chunk = vec![0u8; active_nucl];
-        crate::bit4_to_string(&mut ascii_chunk, &item.data[..], 0, active_nucl);
-
+        // Host post-process: decode packed ops into aligned strings by
+        // reading nibbles directly from the bit4 genome buffer and converting
+        // per char via bit4_to_char. No upfront ASCII decode of the whole
+        // chunk — saves ~active_nucl bytes of memory and the decode pass.
         use rayon::prelude::*;
         let decoded: Vec<(SearchMatch, MyersAlignment)> = raw_matches
             .par_iter()
             .filter_map(|raw| {
                 let pattern_ascii = &patterns_ascii[raw.pattern_idx as usize];
-                decode_gpu_enum_match(raw, &ascii_chunk, pattern_ascii)
+                decode_gpu_enum_match(raw, &item.data[..], pattern_ascii)
             })
             .collect();
         let (final_matches, alignments): (Vec<_>, Vec<_>) = decoded.into_iter().unzip();

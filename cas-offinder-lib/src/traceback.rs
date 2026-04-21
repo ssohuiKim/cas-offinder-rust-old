@@ -28,6 +28,14 @@ fn cmp_loose(pc: u8, tc: u8) -> bool {
     pu == tu
 }
 
+/// Bit4 match: true if any nucleotide bit overlaps (N = 0xF matches anything).
+/// Must be consistent with the GPU kernel's comparison so CPU and GPU emit
+/// the same alignment set. bit4 == 0 means padding / invalid — never matches.
+#[inline(always)]
+fn cmp_loose_bit4(p: u8, t: u8) -> bool {
+    (p & t) != 0
+}
+
 /// Reconstruct the best alignment of `pattern` ending at text position `text.len()`.
 /// Semi-global: pattern must be fully matched; text start is free.
 /// Returns None if no alignment found with edit distance <= max_edits.
@@ -162,38 +170,38 @@ pub fn traceback(
 /// (a) per-type caps and (b) `dp[i][j]` lower bound on remaining cost. In
 /// practice this emits only a handful of alignments per candidate.
 pub fn traceback_all(
-    pattern: &[u8],
-    text: &[u8],
+    pattern_bit4: &[u8],
+    text_bit4: &[u8],
     max_edits: u32,
     max_dna_bulges: u32,
     max_rna_bulges: u32,
     max_mismatches: u32,
     pam_is_n: &[bool],
 ) -> Vec<Alignment> {
-    let m = pattern.len();
-    let n = text.len();
+    let m = pattern_bit4.len();
+    let n = text_bit4.len();
     debug_assert_eq!(pam_is_n.len(), m);
 
     const INF: u32 = u32::MAX / 2;
     let dna_cost: u32 = if max_dna_bulges == 0 { INF } else { 1 };
     let rna_cost: u32 = if max_rna_bulges == 0 { INF } else { 1 };
 
-    // Fill DP as in `traceback`, so we can use dp[i][j] as a lower-bound prune.
-    // Text bytes equal to 0 are chromosome-boundary padding (bit4 0 decodes to
-    // NUL). Treat such cells as INF so alignments cannot pass through padding —
-    // otherwise multi-path enumeration happily emits bogus hits that straddle
-    // the gap between two concatenated chromosomes.
+    // Fill DP using bit4 AND for the match test. Bit4 = 0 is padding at a
+    // chromosome boundary and must never match anything; we mark those cells
+    // as INF so multi-path enumeration can't straddle two concatenated
+    // chromosomes. This is the same comparison the GPU kernel uses so CPU
+    // and GPU enumerate the same alignment set.
     let mut dp = vec![vec![0u32; n + 1]; m + 1];
     for i in 0..=m {
         dp[i][0] = (i as u32).saturating_mul(rna_cost).min(INF);
     }
     for i in 1..=m {
         for j in 1..=n {
-            if text[j - 1] == 0 {
+            if text_bit4[j - 1] == 0 {
                 dp[i][j] = INF;
                 continue;
             }
-            let match_cost = if cmp_loose(pattern[i - 1], text[j - 1]) { 0 } else { 1 };
+            let match_cost = if cmp_loose_bit4(pattern_bit4[i - 1], text_bit4[j - 1]) { 0 } else { 1 };
             dp[i][j] = std::cmp::min(
                 dp[i - 1][j - 1].saturating_add(match_cost),
                 std::cmp::min(
@@ -213,7 +221,7 @@ pub fn traceback_all(
         m, n,
         &mut ops,
         0, 0, 0, 0,
-        &dp, pattern, text,
+        &dp, pattern_bit4, text_bit4,
         max_edits, max_dna_bulges, max_rna_bulges, max_mismatches,
         pam_is_n,
         &mut results,
@@ -231,8 +239,8 @@ fn enumerate(
     db: u32,
     rb: u32,
     dp: &[Vec<u32>],
-    pattern: &[u8],
-    text: &[u8],
+    pattern_bit4: &[u8],
+    text_bit4: &[u8],
     max_edits: u32,
     max_dna: u32,
     max_rna: u32,
@@ -250,6 +258,9 @@ fn enumerate(
     if i == 0 {
         // Reached pattern start; semi-global text prefix is free.
         // ops was pushed in walk-back order; reverse for output.
+        // Emit pattern_aligned / text_aligned as ASCII (bit4 -> char) so
+        // downstream consumers and the output writer can use them directly.
+        use crate::bit4ops::bit4_to_char;
         let mut ops_fwd = ops.clone();
         ops_fwd.reverse();
         let mut pa: Vec<u8> = Vec::with_capacity(ops_fwd.len());
@@ -259,19 +270,19 @@ fn enumerate(
         for op in &ops_fwd {
             match op {
                 EditOp::Match | EditOp::Substitution => {
-                    pa.push(pattern[pi]);
-                    ta.push(text[ti]);
+                    pa.push(bit4_to_char(pattern_bit4[pi]));
+                    ta.push(bit4_to_char(text_bit4[ti]));
                     pi += 1;
                     ti += 1;
                 }
                 EditOp::RnaBulge => {
-                    pa.push(pattern[pi]);
+                    pa.push(bit4_to_char(pattern_bit4[pi]));
                     ta.push(b'-');
                     pi += 1;
                 }
                 EditOp::DnaBulge => {
                     pa.push(b'-');
-                    ta.push(text[ti]);
+                    ta.push(bit4_to_char(text_bit4[ti]));
                     ti += 1;
                 }
             }
@@ -290,14 +301,14 @@ fn enumerate(
 
     // Diagonal: match / substitution
     if j > 0 {
-        let mc = if cmp_loose(pattern[i - 1], text[j - 1]) { 0 } else { 1 };
+        let mc = if cmp_loose_bit4(pattern_bit4[i - 1], text_bit4[j - 1]) { 0 } else { 1 };
         let touches_n = mc == 1 && pam_is_n[i - 1];
         if !touches_n {
             ops.push(if mc == 0 { EditOp::Match } else { EditOp::Substitution });
             enumerate(
                 i - 1, j - 1, ops,
                 cost + mc, mm + mc, db, rb,
-                dp, pattern, text,
+                dp, pattern_bit4, text_bit4,
                 max_edits, max_dna, max_rna, max_mm,
                 pam_is_n, results,
             );
@@ -313,7 +324,7 @@ fn enumerate(
             enumerate(
                 i - 1, j, ops,
                 cost + 1, mm, db, rb + 1,
-                dp, pattern, text,
+                dp, pattern_bit4, text_bit4,
                 max_edits, max_dna, max_rna, max_mm,
                 pam_is_n, results,
             );
@@ -324,13 +335,13 @@ fn enumerate(
     // DNA bulge: text char consumed, no pattern char. Skip if adjacent to PAM.
     if db < max_dna && max_dna > 0 && j > 0 {
         let prev_n = i > 0 && pam_is_n[i - 1];
-        let next_n = i < pattern.len() && pam_is_n[i];
+        let next_n = i < pattern_bit4.len() && pam_is_n[i];
         if !prev_n && !next_n {
             ops.push(EditOp::DnaBulge);
             enumerate(
                 i, j - 1, ops,
                 cost + 1, mm, db + 1, rb,
-                dp, pattern, text,
+                dp, pattern_bit4, text_bit4,
                 max_edits, max_dna, max_rna, max_mm,
                 pam_is_n, results,
             );
