@@ -257,7 +257,10 @@ fn search_device_ocl(
         let pattern_blocked_size = roundup(cdiv(pattern_len, 2), PATTERN_CHUNK_SIZE);
         assert!(patterns.len() % pattern_blocked_size == 0);
         let n_patterns = patterns.len() / pattern_blocked_size;
-        for item in recv.iter() {
+        for mut item in recv.iter() {
+            // Zero out genome 'N' (bit4=0xF) for popcount semantics. See the
+            // comment on mask_genome_n_to_zero_inplace in search_device_cpu_thread.
+            mask_genome_n_to_zero_inplace(&mut item.data);
             let total_chunks = item.meta.chr_names.len();
             let n_chunks = if item.meta.has_overlap_tail {
                 total_chunks - 1
@@ -269,6 +272,8 @@ fn search_device_ocl(
                 *item.meta.chunk_byte_offsets.last().unwrap() as usize;
             let n_genome_blocks = n_genome_bytes / prefered_block_size(&dev)?;
             let n_genome_execs = n_genome_blocks / CL_BLOCKS_PER_EXEC;
+            let match_start_min_nucl: u32 =
+                legacy_match_start_min_nucl(&item.meta, pattern_len);
             let cur_genome_buf = &mut genome_bufs[0];
             let cur_size_buf = &mut out_counts[0];
             let cur_out_buf = &mut out_bufs[0];
@@ -286,6 +291,7 @@ fn search_device_ocl(
                 .set_arg(cur_genome_buf)
                 .set_arg(&pattern_buf)
                 .set_arg(&max_mismatches)
+                .set_arg(&match_start_min_nucl)
                 .set_arg(cur_out_buf)
                 .set_arg(cur_size_buf)
                 .set_global_work_sizes(&[n_genome_execs, n_patterns])
@@ -417,6 +423,7 @@ fn search_chunk_cpu(
     pattern_len: usize,
     packed_patterns: &[u8],
     data: &[u8],
+    match_start_min_nucl: u32,
 ) -> Vec<SearchMatch> {
     let mut matches: Vec<SearchMatch> = Vec::new();
     assert!(
@@ -456,10 +463,30 @@ fn search_chunk_cpu(
                     }
                 }
                 for o in 0..BLOCKS_PER_EXEC {
-                    let mismatches = pattern_len as u32 - num_matches[o];
-                    if mismatches <= max_mismatches {
+                    // Use signed arithmetic: genome 'N' (bit4=0xF) can inflate
+                    // popcount above pattern_len at pattern-N positions so the
+                    // unsigned subtraction would underflow. Negative values
+                    // here still mean "at least as matched as a zero-mm hit",
+                    // so they must pass the threshold. main.rs recomputes the
+                    // real mismatch count against cas-offinder semantics.
+                    let mismatches_i =
+                        pattern_len as i32 - num_matches[o] as i32;
+                    if mismatches_i <= max_mismatches as i32 {
+                        let start_nucl = ((gen_idx + o) * NUCL_PER_BLOCK + l) as u32;
+                        // Skip matches whose START lies inside the head-overlap
+                        // region AND whose window fits entirely within chunk 0 —
+                        // those were already emitted by the previous batch.
+                        // Matches that start in chunk 0 but extend into chunk 1
+                        // (start_nucl >= match_start_min_nucl) are kept because
+                        // the previous batch rejected them via is_past_end.
+                        if start_nucl < match_start_min_nucl {
+                            continue;
+                        }
+                        // Cap kernel mm at 0 when negative; main.rs overrides
+                        // this with the real count anyway.
+                        let mismatches = mismatches_i.max(0) as u32;
                         matches.push(SearchMatch {
-                            chunk_idx: ((gen_idx + o) * NUCL_PER_BLOCK + l) as u32,
+                            chunk_idx: start_nucl,
                             pattern_idx: j as u32,
                             mismatches: mismatches,
                             dna_bulge_size: 0,
@@ -498,14 +525,67 @@ fn search_device_cpu_thread(
     recv: crossbeam_channel::Receiver<SearchChunkInfo>,
     dest: mpsc::SyncSender<SearchChunkResult>,
 ) {
-    for schunk in recv.iter() {
+    for mut schunk in recv.iter() {
+        let match_start_min_nucl = legacy_match_start_min_nucl(&schunk.meta, pattern_len);
+        // Popcount semantics treat genome 'N' as a mismatch (cas-offinder C++
+        // behaviour). The bit4 genome buffer encodes 'N' as 0xF to distinguish
+        // it from chunk-boundary padding (0) — but popcount wants N to zero
+        // out so `pattern_bit4 & genome_bit4` doesn't spuriously "match" at
+        // ambiguous bases. Mask the copy used by this path.
+        mask_genome_n_to_zero_inplace(&mut schunk.data);
         dest.send(SearchChunkResult {
-            matches: search_chunk_cpu(max_mismatches, pattern_len, &packed_patterns, &schunk.data),
+            matches: search_chunk_cpu(
+                max_mismatches,
+                pattern_len,
+                &packed_patterns,
+                &schunk.data,
+                match_start_min_nucl,
+            ),
             meta: schunk.meta,
             data: schunk.data,
         })
         .unwrap();
     }
+}
+
+/// Zero out any bit4 nibble equal to 0xF (genome 'N' / wildcard). Used by the
+/// legacy popcount path to restore the C++ cas-offinder semantic that genome
+/// ambiguity counts as a mismatch at specific-base pattern positions. The
+/// mask is applied in place because every chunk is consumed exactly once.
+fn mask_genome_n_to_zero_inplace(data: &mut [u8]) {
+    // Bit-parallel across u64 lanes: a nibble equals 0xF iff all four of its
+    // bits are set, so `x & x>>1 & x>>2 & x>>3` isolates the lowest bit of
+    // each 0xF nibble into the `low-bit of each nibble` position.
+    const NIBBLE_LOW: u64 = 0x1111_1111_1111_1111;
+    let (prefix, mid, suffix) = unsafe { data.align_to_mut::<u64>() };
+    for b in prefix.iter_mut().chain(suffix.iter_mut()) {
+        let hi = (*b >> 4) & 0x0F;
+        let lo = *b & 0x0F;
+        let hi_masked = if hi == 0x0F { 0 } else { hi };
+        let lo_masked = if lo == 0x0F { 0 } else { lo };
+        *b = (hi_masked << 4) | lo_masked;
+    }
+    for w in mid.iter_mut() {
+        let x = *w;
+        let all_set = x & (x >> 1) & (x >> 2) & (x >> 3) & NIBBLE_LOW;
+        let full_mask = all_set | (all_set << 1) | (all_set << 2) | (all_set << 3);
+        *w = x & !full_mask;
+    }
+}
+
+/// For the legacy popcount path, compute the lowest match START nucleotide
+/// that must be emitted in this batch. Matches whose window fits entirely
+/// inside chunk 0 (the head-overlap carried from the previous batch) were
+/// already emitted there; skip them. Matches starting in chunk 0 but
+/// extending into chunk 1 were rejected by the previous batch via
+/// `is_past_end` and MUST be emitted here, so the threshold stops
+/// `pattern_len - 1` short of chunk 0's end.
+fn legacy_match_start_min_nucl(meta: &SearchChunkMeta, pattern_len: usize) -> u32 {
+    if !meta.has_overlap_head {
+        return 0;
+    }
+    let chunk1_start_nucl = meta.chunk_byte_offsets[1] as usize * 2;
+    chunk1_start_nucl.saturating_sub(pattern_len - 1) as u32
 }
 fn search_compute_cpu(
     max_mismatches: u32,
@@ -618,7 +698,17 @@ fn classify_myers_candidate(
                 EditOp::Match | EditOp::Substitution => {
                     let g_bit4 = get_bit4(genome_bit4, text_start_in_chunk + g_off);
                     let f_bit4 = eff_filter[p_in_pat];
-                    if (g_bit4 & f_bit4) == 0 {
+                    // cas-offinder rule: filter N (0xF) admits any genome base
+                    // (including genome N); filter specific base rejects padding
+                    // (0) and genome N (0xF).
+                    let filter_ok = if f_bit4 == 0xF {
+                        g_bit4 != 0
+                    } else if g_bit4 == 0 || g_bit4 == 0xF {
+                        false
+                    } else {
+                        (g_bit4 & f_bit4) != 0
+                    };
+                    if !filter_ok {
                         continue 'alignments;
                     }
                     p_in_pat += 1;
@@ -689,7 +779,17 @@ fn check_pam_quick(
                 break;
             }
             let g = crate::bit4ops::get_bit4(genome_bit4, gpos);
-            if (g & f) == 0 {
+            // cas-offinder PAM rule: filter N (0xF) accepts any genome base
+            // including genome N; a specific filter base must match the genome
+            // base, and genome N does NOT satisfy a specific filter position.
+            let pos_ok = if f == 0xF {
+                g != 0 // still reject padding
+            } else if g == 0 || g == 0xF {
+                false
+            } else {
+                (g & f) != 0
+            };
+            if !pos_ok {
                 ok = false;
                 break;
             }
@@ -779,18 +879,29 @@ fn search_chunk_myers(
             }
 
             // Fresh Myers sweep over the candidate's text window, mirroring
-            // the GPU kernel exactly. Bit4 NUL (0) contributes no peq bits.
+            // the GPU kernel exactly.
+            //   bit4 == 0    → padding (no peq bits contribute)
+            //   bit4 == 0xF  → genome 'N' — per cas-offinder, match only
+            //                  positions where pattern is 'N'
+            //   otherwise    → OR the per-base peqs matching set bits
             let text_start = (t_pos + 1).saturating_sub(text_window_len);
             let mut vp: u64 = mask;
             let mut vn: u64 = 0;
             let mut score: i32 = pattern_len as i32;
             for t in text_start..=t_pos {
                 let b4 = get_bit4(chunk_data_bit4, t);
-                let mut eq: u64 = 0;
-                if b4 & 0x4 != 0 { eq |= peq.peq[0]; } // A
-                if b4 & 0x2 != 0 { eq |= peq.peq[1]; } // C
-                if b4 & 0x8 != 0 { eq |= peq.peq[2]; } // G
-                if b4 & 0x1 != 0 { eq |= peq.peq[3]; } // T
+                let eq: u64 = if b4 == 0 {
+                    0
+                } else if b4 == 0xF {
+                    peq.peq_n
+                } else {
+                    let mut e = 0u64;
+                    if b4 & 0x4 != 0 { e |= peq.peq[0]; } // A
+                    if b4 & 0x2 != 0 { e |= peq.peq[1]; } // C
+                    if b4 & 0x8 != 0 { e |= peq.peq[2]; } // G
+                    if b4 & 0x1 != 0 { e |= peq.peq[3]; } // T
+                    e
+                };
                 let x = eq | vn;
                 let d0 = (((x & vp).wrapping_add(vp)) ^ vp) | x;
                 let hn = vp & d0;
@@ -970,13 +1081,18 @@ fn search_compute_cpu_myers(
 // Myers GPU path
 // ============================================================================
 
+/// Layout per pattern: [A, C, G, T, N] — 5 u64 words. Slot 4 is `peq_n`, the
+/// bit mask of pattern positions holding 'N' (wildcard), used when the genome
+/// position is itself 'N' (bit4==0xF). Must match the indexing in
+/// kernel_myers.cl (PEQ_STRIDE = 5).
 fn build_peq_array(peqs: &[crate::myers::PeqTable]) -> Vec<u64> {
-    let mut out = Vec::with_capacity(peqs.len() * 4);
+    let mut out = Vec::with_capacity(peqs.len() * 5);
     for peq in peqs {
         out.push(peq.peq[0]);
         out.push(peq.peq[1]);
         out.push(peq.peq[2]);
         out.push(peq.peq[3]);
+        out.push(peq.peq_n);
     }
     out
 }

@@ -32,6 +32,7 @@ typedef struct s_match match;
 __kernel void find_matches(__global block_ty* genome,
                             __global block_ty* pattern_blocks,
                             uint32_t max_mismatches,
+                            uint32_t match_start_min_nucl,
                             __global match* match_buffer,
                            __global int* entrycount)
 {
@@ -63,13 +64,20 @@ __kernel void find_matches(__global block_ty* genome,
         shifted_blocks[BLOCKS_PER_PATTERN + BLOCKS_PER_EXEC - 1] >>= 4;
 #pragma unroll
         for(size_t o = 0; o < BLOCKS_PER_EXEC; o++){
-            int mismatches = PATTERN_LEN - counts[o];
-            if (mismatches <= max_mismatches) {
+            // Signed comparison: genome 'N' (bit4=0xF) inflates popcount at
+            // pattern-N positions. Negative mm still counts as "at most
+            // max_mismatches" and must pass the kernel filter; the host
+            // recomputes the real cas-offinder mismatch count.
+            int mismatches = (int)PATTERN_LEN - (int)counts[o];
+            uint32_t loc = (genome_idx + o) * BLOCKS_AVAIL + k;
+            if (mismatches <= (int)max_mismatches && loc >= match_start_min_nucl) {
                 int next_idx = atomic_inc(entrycount);
+                // Clamp at 0: host-side post-hoc filter recomputes real mm.
+                uint32_t mm_u = (mismatches < 0) ? 0u : (uint32_t)mismatches;
                 match next_item = {
-                    .loc = (genome_idx + o) * BLOCKS_AVAIL + k,
+                    .loc = loc,
                     .pattern_idx = pattern_block_idx,
-                    .mismatches = mismatches,
+                    .mismatches = mm_u,
                     .dna_bulge_size = 0,
                     .rna_bulge_size = 0,
                 };

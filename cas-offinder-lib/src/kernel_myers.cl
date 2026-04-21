@@ -24,6 +24,28 @@
 #define INF_COST 100
 #define PATTERN_BYTES (((PATTERN_LEN) + 1) / 2)
 #define MAX_OPS (PATTERN_LEN + MAX_DNA_BULGES)
+#define PEQ_STRIDE 5   // must match build_peq_array in search.rs
+
+// cas-offinder match/mismatch rule (bit4):
+//   tb4 == 0    → padding, mismatch
+//   pb4 == 0xF  → pattern N wildcard, match
+//   tb4 == 0xF  → genome N, matches only pattern N (so pb4 != 0xF → mismatch)
+//   otherwise   → (pb4 & tb4) != 0
+static inline uchar match_cost_bit4(uchar pb4, uchar tb4) {
+    if (tb4 == 0)    return 1;
+    if (pb4 == 0x0F) return 0;
+    if (tb4 == 0x0F) return 1;
+    return ((pb4 & tb4) != 0) ? 0 : 1;
+}
+
+// PAM-filter rule: filter N accepts any genome except padding; filter
+// specific requires a specific genome base (rejects both padding and
+// genome N).
+static inline uchar pam_cell_ok(uchar g, uchar f) {
+    if (f == 0x0F) return (g != 0) ? 1 : 0;
+    if (g == 0 || g == 0x0F) return 0;
+    return ((g & f) != 0) ? 1 : 0;
+}
 
 struct s_match {
     uint  chunk_idx;         // genome position of leftmost aligned text char
@@ -82,17 +104,18 @@ __kernel void find_matches_myers(
             if (gpos >= total_nucl) { this_ok = false; break; }
             uchar g = get_bit4(genome_bit4, gpos);
             uchar f = pam_filters_bit4[p * PAM_LEN + k];
-            if ((g & f) == 0) { this_ok = false; break; }
+            if (!pam_cell_ok(g, f)) { this_ok = false; break; }
         }
         if (this_ok) { pam_ok = true; break; }
     }
     if (!pam_ok) return;
 
     // ---- Myers sweep over the text window to bound final edit distance ----
-    ulong peq_a = peq_tables[p * 4 + 0];
-    ulong peq_c = peq_tables[p * 4 + 1];
-    ulong peq_g = peq_tables[p * 4 + 2];
-    ulong peq_t = peq_tables[p * 4 + 3];
+    ulong peq_a = peq_tables[p * PEQ_STRIDE + 0];
+    ulong peq_c = peq_tables[p * PEQ_STRIDE + 1];
+    ulong peq_g = peq_tables[p * PEQ_STRIDE + 2];
+    ulong peq_t = peq_tables[p * PEQ_STRIDE + 3];
+    ulong peq_n = peq_tables[p * PEQ_STRIDE + 4];
 
     ulong mask = (PATTERN_LEN < 64) ? (((ulong)1 << PATTERN_LEN) - 1) : ~(ulong)0;
     ulong last_bit = (ulong)1 << (PATTERN_LEN - 1);
@@ -104,11 +127,19 @@ __kernel void find_matches_myers(
     uint text_len = j + 1 - text_start;  // <= TEXT_WINDOW
     for (uint t = text_start; t <= j; t++) {
         uchar b4 = get_bit4(genome_bit4, t);
-        ulong eq = 0;
-        if (b4 & 0x4) eq |= peq_a;
-        if (b4 & 0x2) eq |= peq_c;
-        if (b4 & 0x8) eq |= peq_g;
-        if (b4 & 0x1) eq |= peq_t;
+        ulong eq;
+        if (b4 == 0) {
+            eq = 0;
+        } else if (b4 == 0x0F) {
+            // genome N: match only pattern N (cas-offinder C++ semantics)
+            eq = peq_n;
+        } else {
+            eq = 0;
+            if (b4 & 0x4) eq |= peq_a;
+            if (b4 & 0x2) eq |= peq_c;
+            if (b4 & 0x8) eq |= peq_g;
+            if (b4 & 0x1) eq |= peq_t;
+        }
 
         ulong x = eq | vn;
         ulong d0 = (((x & vp) + vp) ^ vp) | x;
@@ -156,7 +187,7 @@ __kernel void find_matches_myers(
                 dp[pi * (TEXT_WINDOW + 1) + tj] = INF_COST;
                 continue;
             }
-            uchar mc = ((pb4 & tb4) != 0) ? 0 : 1;
+            uchar mc = match_cost_bit4(pb4, tb4);
             uint diag = (uint)dp[(pi - 1) * (TEXT_WINDOW + 1) + (tj - 1)] + mc;
             uint up   = (uint)dp[(pi - 1) * (TEXT_WINDOW + 1) + tj] + (uint)rna_cost;
             uint left = (uint)dp[pi       * (TEXT_WINDOW + 1) + (tj - 1)] + (uint)dna_cost;
@@ -277,7 +308,7 @@ __kernel void find_matches_myers(
             if (ctj > 0) {
                 uchar pb4 = get_pattern(pattern_bit4, p, cpi - 1);
                 uchar tb4 = get_bit4(genome_bit4, text_start + ctj - 1);
-                uchar mc = ((pb4 & tb4) != 0) ? 0 : 1;
+                uchar mc = match_cost_bit4(pb4, tb4);
                 if (mc == 0 || pb4 != 0x0F) {
                     uchar new_cost = cost + mc;
                     uchar new_mm = mm + mc;
@@ -333,12 +364,19 @@ __kernel void find_matches_myers(
         }
 
         // ---- Try DNA bulge (gap in pattern). ----
+        //
+        // Matches cas-offinder-bulge's rule: allow a bulge between pattern
+        // positions cpi-1 and cpi iff:
+        //   * not strictly inside the PAM (both neighbours == N), and
+        //   * not past the PAM-side end of the pattern (cpi == PATTERN_LEN).
+        // This mirrors traceback.rs:335 for CPU/GPU parity.
         if (trans == 2) {
             stack[top].trans = 3;
-            if (dna_cost != INF_COST && db < MAX_DNA_BULGES && ctj > 0) {
+            if (dna_cost != INF_COST && db < MAX_DNA_BULGES && ctj > 0
+                && cpi < PATTERN_LEN) {
                 uchar prev_n = (cpi > 0) ? (get_pattern(pattern_bit4, p, cpi - 1) == 0x0F) : 0;
-                uchar next_n = (cpi < PATTERN_LEN) ? (get_pattern(pattern_bit4, p, cpi) == 0x0F) : 0;
-                if (!prev_n && !next_n) {
+                uchar next_n = (get_pattern(pattern_bit4, p, cpi) == 0x0F);
+                if (!(prev_n && next_n)) {
                     uchar new_cost = cost + 1;
                     uchar rem = dp[cpi * (TEXT_WINDOW + 1) + (ctj - 1)];
                     if ((uint)new_cost + (uint)rem <= (uint)MAX_EDITS

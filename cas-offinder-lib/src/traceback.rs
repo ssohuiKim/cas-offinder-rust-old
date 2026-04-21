@@ -28,11 +28,20 @@ fn cmp_loose(pc: u8, tc: u8) -> bool {
     pu == tu
 }
 
-/// Bit4 match: true if any nucleotide bit overlaps (N = 0xF matches anything).
-/// Must be consistent with the GPU kernel's comparison so CPU and GPU emit
-/// the same alignment set. bit4 == 0 means padding / invalid — never matches.
+/// Bit4 match following cas-offinder C++ semantics:
+///   * `t == 0`           (padding / outside valid genome) → never match
+///   * `p == 0xF` (pat N) → always match (wildcard)
+///   * `t == 0xF` (gen N) + pattern specific base → **mismatch** (genome N
+///     only matches pattern N, not A/C/G/T)
+///   * otherwise `(p & t) != 0`
+///
+/// Must stay consistent with the GPU kernel, the Myers eq computation, and
+/// the PAM filter — CPU/GPU parity depends on it.
 #[inline(always)]
 fn cmp_loose_bit4(p: u8, t: u8) -> bool {
+    if t == 0 { return false; }
+    if p == 0xF { return true; }
+    if t == 0xF { return false; }
     (p & t) != 0
 }
 
@@ -332,11 +341,21 @@ fn enumerate(
         }
     }
 
-    // DNA bulge: text char consumed, no pattern char. Skip if adjacent to PAM.
-    if db < max_dna && max_dna > 0 && j > 0 {
+    // DNA bulge: text char consumed, no pattern char.
+    //
+    // C++ cas-offinder-bulge allows a bulge between pattern positions i-1 and
+    // i iff:
+    //   * The bulge is NOT strictly inside the PAM (i.e. not both neighbours
+    //     are N). Bulges at the crRNA/PAM boundary — where one neighbour is
+    //     crRNA and the other is the first/last PAM N — are allowed.
+    //   * The bulge does NOT extend past the PAM side of the pattern. In
+    //     backward-DFS terms this is `i == pattern_len` (past-the-end). The
+    //     other end `i == 0` is already unreachable here because enumerate()
+    //     emits and returns as soon as i hits 0.
+    if db < max_dna && max_dna > 0 && j > 0 && i < pattern_bit4.len() {
         let prev_n = i > 0 && pam_is_n[i - 1];
-        let next_n = i < pattern_bit4.len() && pam_is_n[i];
-        if !prev_n && !next_n {
+        let next_n = pam_is_n[i];
+        if !(prev_n && next_n) {
             ops.push(EditOp::DnaBulge);
             enumerate(
                 i, j - 1, ops,

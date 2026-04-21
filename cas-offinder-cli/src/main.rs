@@ -72,6 +72,7 @@ fn main() {
     let out_path_clone = run_info.out_path.clone();
     let search_filter_clone = run_info.search_filter.clone();
     let pattern_len_clone = run_info.pattern_len;
+    let max_mismatches_clone = run_info.max_mismatches;
     let use_myers = run_info.max_dna_bulges > 0 || run_info.max_rna_bulges > 0;
     // PAM length = positions where the user's crRNA patterns hold N placeholders
     // (PAM is always at the end in the original crRNA orientation). Counted from
@@ -140,7 +141,7 @@ fn main() {
         let mut total_matches: u64 = 0;
 
         for chunk in dest_receiver.iter() {
-            for m in chunk {
+            for mut m in chunk {
                 let (bulge_type, bulge_size, rna_out, dna_out);
                 let dir = if m.is_forward { '+' } else { '-' };
 
@@ -158,21 +159,62 @@ fn main() {
                     rna_out = m.rna_seq.clone();
                     dna_out = m.dna_seq.clone();
                 } else {
-                    // Legacy popcount path (bulge=0): apply post-hoc PAM filter,
-                    // mark mismatched DNA bases lowercase (old convention).
-                    dna_buf.fill(0);
-                    string_to_bit4(&mut dna_buf, &m.dna_seq, 0, false);
-                    let n_search_matches: u32 = dna_buf
-                        .iter()
-                        .zip(search_filter_buf.iter())
-                        .map(|(x1, x2)| (*x1 & *x2).count_ones())
-                        .sum();
-                    if n_search_matches as usize != pattern_len_clone {
+                    // Legacy popcount path (bulge=0): apply post-hoc PAM filter
+                    // and mark mismatched DNA bases lowercase (old convention).
+                    //
+                    // C++ cas-offinder semantics for genome 'N':
+                    //   * pattern N (wildcard) + genome anything (incl. N) → match
+                    //   * pattern specific + genome N → mismatch, shown lowercase 'n'
+                    //   * filter N  + genome anything (incl. N) → PAM filter passes
+                    //   * filter specific + genome same → PAM filter passes
+                    //   * filter specific + genome N → PAM filter FAILS (reject)
+                    //
+                    // The kernel's popcount also over-counts mismatches by 1 per
+                    // (pattern N, genome N) cell because `0xF & 0 == 0`. We
+                    // recompute mismatches here from the raw DNA string.
+                    let mut pam_ok = true;
+                    let mut actual_mm: u32 = 0;
+                    for (pos, &dna_c) in m.dna_seq.iter().enumerate() {
+                        let filter_c = search_filter_clone[pos];
+                        if !(filter_c == b'N' || filter_c == b'n') {
+                            // PAM position: genome must match filter base.
+                            // dna_c == 0 (NUL = genome N) always fails here.
+                            if !cmp_chars(dna_c, filter_c) {
+                                pam_ok = false;
+                                break;
+                            }
+                        }
+                        let rna_c = m.rna_seq[pos];
+                        if !(rna_c == b'N' || rna_c == b'n') && !cmp_chars(dna_c, rna_c) {
+                            actual_mm += 1;
+                        }
+                    }
+                    if !pam_ok {
                         continue;
                     }
+                    if actual_mm > max_mismatches_clone {
+                        continue;
+                    }
+                    // m.mismatches was the kernel's popcount-derived count.
+                    // Replace it with the C++-consistent actual_mm.
+                    m.mismatches = actual_mm;
                     marked_dna_buf.clone_from_slice(&m.dna_seq);
                     for (dnac, rnac) in marked_dna_buf.iter_mut().zip(m.rna_seq.iter()) {
-                        if !cmp_chars(*dnac, *rnac) {
+                        let rna_is_n = *rnac == b'N' || *rnac == b'n';
+                        let dna_is_n = *dnac == b'N' || *dnac == b'n';
+                        if *dnac == 0 {
+                            // Shouldn't happen with the new mixed_base=true
+                            // genome encoding (padding never decodes here),
+                            // but keep a safe fallback: show as pattern-aware
+                            // 'N' / 'n'.
+                            *dnac = if rna_is_n { b'N' } else { b'n' };
+                        } else if rna_is_n {
+                            // Pattern N is a wildcard; always a match — keep
+                            // uppercase regardless of the genome base.
+                        } else if dna_is_n {
+                            // Pattern specific + genome N = mismatch; lowercase.
+                            *dnac = b'n';
+                        } else if !cmp_chars(*dnac, *rnac) {
                             *dnac |= !0xdf;
                         }
                     }

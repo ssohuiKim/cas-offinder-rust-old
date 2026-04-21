@@ -4,9 +4,14 @@
 
 /// Peq table: for each base (A, C, G, T), a bit-vector indicating
 /// which pattern positions match that base. Pattern length <= 64.
+/// `peq_n` marks positions where the pattern holds 'N' (wildcard). When a
+/// genome position is itself 'N' (bit4 == 0xF) the Myers sweep uses only
+/// `peq_n`, so genome 'N' matches pattern 'N' and mismatches pattern
+/// specific bases — matching cas-offinder's C++ convention.
 #[derive(Debug, Clone, Copy)]
 pub struct PeqTable {
     pub peq: [u64; 4], // indexed by nucl_idx: A=0, C=1, G=2, T=3
+    pub peq_n: u64,
     pub pattern_len: usize,
 }
 
@@ -27,17 +32,21 @@ fn nucl_idx(c: u8) -> u8 {
 pub fn build_peq(pattern: &[u8]) -> PeqTable {
     assert!(pattern.len() <= 64, "Myers requires pattern length <= 64");
     let mut peq = [0u64; 4];
+    let mut peq_n = 0u64;
     for (i, &c) in pattern.iter().enumerate() {
         let idx = nucl_idx(c);
         if idx < 4 {
             peq[idx as usize] |= 1u64 << i;
         } else {
+            // Wildcard (N/IUPAC): match all 4 concrete bases AND count as
+            // match when the genome itself is an 'N'.
             for p in peq.iter_mut() {
                 *p |= 1u64 << i;
             }
+            peq_n |= 1u64 << i;
         }
     }
-    PeqTable { peq, pattern_len: pattern.len() }
+    PeqTable { peq, peq_n, pattern_len: pattern.len() }
 }
 
 /// Compute minimum edit distance: pattern must fully match some suffix of
@@ -57,7 +66,8 @@ pub fn myers_edit_distance(peq: &PeqTable, text: &[u8]) -> u32 {
         let eq = if idx < 4 {
             peq.peq[idx as usize]
         } else {
-            peq.peq[0] | peq.peq[1] | peq.peq[2] | peq.peq[3]
+            // Genome 'N': per cas-offinder C++, matches only pattern 'N'.
+            peq.peq_n
         };
         let x = eq | vn;
         let d0 = (((x & vp).wrapping_add(vp)) ^ vp) | x;
