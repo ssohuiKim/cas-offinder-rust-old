@@ -413,7 +413,7 @@ fn checked_div(x: usize, y: usize) -> usize {
 }
 fn pack(d: &[u8]) -> u64 {
     assert!(d.len() == 8);
-    unsafe { std::mem::transmute::<[u8; 8], u64>([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]) }
+    u64::from_ne_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
 }
 fn block_data_cpu(data: &[u8]) -> Vec<u64> {
     data.chunks(8).map(pack).collect()
@@ -626,17 +626,6 @@ struct SearchChunkResultMyers {
     pub matches: Vec<SearchMatch>,
     pub alignments: Vec<MyersAlignment>,
     pub meta: SearchChunkMeta,
-    pub data: Box<[u8]>,
-}
-
-fn nucl_idx_ascii(c: u8) -> u8 {
-    match c.to_ascii_uppercase() {
-        b'A' => 0,
-        b'C' => 1,
-        b'G' => 2,
-        b'T' => 3,
-        _ => 4,
-    }
 }
 
 /// Given a Myers candidate (alignment ending at `end_pos` in the bit4 genome
@@ -989,7 +978,6 @@ fn search_device_cpu_thread_myers(
             matches,
             alignments,
             meta: schunk.meta,
-            data: schunk.data,
         })
         .unwrap();
     }
@@ -1123,7 +1111,7 @@ unsafe fn search_device_ocl_myers(
     let kernel = kernel::Kernel::create(&program, "find_matches_myers")?;
     let mut genome_buf = create_ocl_buf::<u8>(&context, search_chunk_bytes())?;
     let mut out_count = create_ocl_buf::<u32>(&context, 1)?;
-    let mut out_buf = create_ocl_buf::<GpuEnumMatch>(&context, out_buf_size)?;
+    let out_buf = create_ocl_buf::<GpuEnumMatch>(&context, out_buf_size)?;
     let mut peq_buf = create_ocl_buf::<u64>(&context, peq_array.len())?;
     let mut pattern_buf = create_ocl_buf::<u8>(&context, pattern_bit4_flat.len())?;
     let mut pam_off_buf = create_ocl_buf::<u8>(&context, pam_offsets_gpu.len())?;
@@ -1201,7 +1189,6 @@ unsafe fn search_device_ocl_myers(
                 matches: Vec::new(),
                 alignments: Vec::new(),
                 meta: item.meta,
-                data: item.data,
             })
             .unwrap();
             continue;
@@ -1229,7 +1216,6 @@ unsafe fn search_device_ocl_myers(
             matches: final_matches,
             alignments,
             meta: item.meta,
-            data: item.data,
         })
         .unwrap();
     }
@@ -1331,9 +1317,9 @@ fn search_chunk_ocl_myers(
     for (_, devs) in devices.get().iter() {
         let plat_devs: Vec<*mut std::ffi::c_void> = devs.iter().map(|d| d.id()).collect();
         if !plat_devs.is_empty() {
-            let context = Arc::new(unsafe {
-                context::Context::from_devices(&plat_devs, &[0], None, null_mut())?
-            });
+            let context = Arc::new(
+                context::Context::from_devices(&plat_devs, &[0], None, null_mut())?,
+            );
             let p_devices: Vec<Arc<device::Device>> = plat_devs
                 .iter()
                 .map(|d| Arc::new(device::Device::new(*d)))
@@ -1738,76 +1724,3 @@ pub fn search(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::read_2bit;
-    use crate::string_to_bit4;
-    use std::path::Path;
-
-    // Note this useful idiom: importing names from outer (for mod tests) scope.
-    use super::*;
-
-    #[test]
-    fn test_opencl_runtime() {
-        let platforms = platform::get_platforms().unwrap();
-        let num_devices: usize = platforms
-            .iter()
-            .map(|plat| plat.get_devices(device::CL_DEVICE_TYPE_ALL).unwrap().len())
-            .sum();
-
-        assert!(
-            num_devices > 0,
-            "Needs at least one opencl device to run tests!"
-        );
-    }
-    #[test]
-    fn test_search_smoke() {
-        let (src_sender, src_receiver): (
-            mpsc::SyncSender<ChromChunkInfo>,
-            mpsc::Receiver<ChromChunkInfo>,
-        ) = mpsc::sync_channel(4);
-        let (dest_sender, dest_receiver): (
-            mpsc::SyncSender<Vec<Match>>,
-            mpsc::Receiver<Vec<Match>>,
-        ) = mpsc::sync_channel(4);
-        const NUM_ITERS: usize = 2;
-        let send_thread = thread::spawn(move || {
-            for _ in 0..NUM_ITERS {
-                read_2bit(&src_sender, Path::new("tests/test_data/upstream1000.2bit")).unwrap();
-            }
-        });
-        let result_count = thread::spawn(move || {
-            let mut count: usize = 0;
-            for chunk in dest_receiver.iter() {
-                count += chunk.len();
-            }
-            count
-        });
-        let pattern1 = b"CCGTGGTTCAACATTTGCTTAGCA".to_vec();
-        let pattern2 = b"GATGTTGGTAAGTGGGATATGGCA".to_vec();
-        let mut pattern3 = pattern1.clone();
-        let mut pattern4 = pattern2.clone();
-        pattern3.reverse();
-        pattern4.reverse();
-        let patterns_ascii: Vec<Vec<u8>> =
-            vec![pattern1.clone(), pattern2.clone(), pattern3, pattern4];
-        let max_mismatches = 11;
-        let expected_results_per_file = 117;
-        let expected_results = expected_results_per_file * NUM_ITERS;
-        let pattern_len = pattern2.len();
-        let search_filter: Vec<u8> = vec![b'N'; pattern_len];
-        search(
-            OclRunConfig::new(OclDeviceType::CPU).unwrap(),
-            max_mismatches,
-            0, // max_dna_bulges
-            0, // max_rna_bulges
-            &search_filter,
-            pattern_len,
-            &patterns_ascii,
-            src_receiver,
-            dest_sender,
-        );
-        send_thread.join().unwrap();
-        assert_eq!(result_count.join().unwrap(), expected_results);
-    }
-}

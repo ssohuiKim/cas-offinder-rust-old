@@ -11,7 +11,7 @@ use std::sync::mpsc::SyncSender;
 fn read_u32(reader: &mut BufReader<std::fs::File>) -> Result<u32> {
     let mut buf = [0_u8; 4];
     reader.read_exact(&mut buf)?;
-    unsafe { Ok(std::mem::transmute::<[u8; 4], u32>(buf)) }
+    Ok(u32::from_ne_bytes(buf))
 }
 fn read_u8(reader: &mut BufReader<std::fs::File>) -> Result<u8> {
     let mut buf = [0_u8; 1];

@@ -134,9 +134,6 @@ fn main() {
         )
         .unwrap();
 
-        let mut search_filter_buf = vec![0_u8; cdiv(pattern_len_clone, 2)];
-        string_to_bit4(&mut search_filter_buf, &search_filter_clone, 0, true);
-        let mut dna_buf = vec![0_u8; cdiv(pattern_len_clone, 2)];
         let mut marked_dna_buf: Vec<u8> = vec![0_u8; pattern_len_clone];
         let mut total_matches: u64 = 0;
 

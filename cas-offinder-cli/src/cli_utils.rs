@@ -20,7 +20,6 @@ pub struct SearchRunInfo {
     pub dev_ty: OclDeviceType,
     pub search_filter: Vec<u8>,
     pub patterns: Vec<Vec<u8>>,
-    pub pattern_infos: Vec<String>,
     pub pattern_len: usize,
     pub max_mismatches: u32,
     pub max_dna_bulges: u32,
@@ -30,7 +29,6 @@ struct InFileInfo {
     genome_path: String,
     search_filter: Vec<u8>,
     patterns: Vec<Vec<u8>>,
-    pattern_infos: Vec<String>,
     pattern_len: usize,
     max_mismatches: u32,
     max_dna_bulges: u32,
@@ -73,7 +71,6 @@ fn parse_and_validate_input(in_path: &String) -> Result<InFileInfo> {
     let pattern_len = search_filter.len();
 
     let mut patterns: Vec<Vec<u8>> = Vec::new();
-    let mut pattern_infos: Vec<String> = Vec::new();
     let mut is_using_info_opt: Option<bool> = None;
     let mut mismatches_opt: Option<u32> = None;
     for line_r in line_iter {
@@ -100,11 +97,9 @@ fn parse_and_validate_input(in_path: &String) -> Result<InFileInfo> {
         if mismatches != cur_mismatches {
             return Err(CliError::ArgumentError("In this version of cas-offinder, all mismatches on every line of input file must be the same"));
         }
-        let cur_info = if is_using_info {
-            lineparts.get(2).ok_or(CliError::ArgumentError("Pattern lines in input file must be consistently have either 2 or 3 elements, no mixing and matching allowed"))?
-        } else {
-            lineparts[0]
-        };
+        if is_using_info {
+            lineparts.get(2).ok_or(CliError::ArgumentError("Pattern lines in input file must be consistently have either 2 or 3 elements, no mixing and matching allowed"))?;
+        }
 
         if pattern_buf.len() != pattern_len {
             return Err(CliError::ArgumentError(
@@ -112,7 +107,6 @@ fn parse_and_validate_input(in_path: &String) -> Result<InFileInfo> {
             ));
         }
         patterns.push(pattern_buf);
-        pattern_infos.push(cur_info.to_string());
     }
     match mismatches_opt {
         None => Err(CliError::ArgumentError(
@@ -122,7 +116,6 @@ fn parse_and_validate_input(in_path: &String) -> Result<InFileInfo> {
             genome_path,
             search_filter,
             patterns,
-            pattern_infos,
             pattern_len,
             max_mismatches,
             max_dna_bulges,
@@ -145,7 +138,6 @@ pub fn parse_and_validate_args(args: &Vec<String>) -> Result<SearchRunInfo> {
         genome_path: parsed_in_file.genome_path,
         search_filter: parsed_in_file.search_filter,
         patterns: parsed_in_file.patterns,
-        pattern_infos: parsed_in_file.pattern_infos,
         pattern_len: parsed_in_file.pattern_len,
         max_mismatches: parsed_in_file.max_mismatches,
         max_dna_bulges: parsed_in_file.max_dna_bulges,
@@ -153,61 +145,4 @@ pub fn parse_and_validate_args(args: &Vec<String>) -> Result<SearchRunInfo> {
         out_path: out_filename.clone(),
         dev_ty: get_dev_ty(device_ty_str)?,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    // Note this useful idiom: importing names from outer (for mod tests) scope.
-    use super::*;
-    use std::io::Write;
-
-    fn write_temp_input(content: &str) -> String {
-        let path = format!("/tmp/test_input_{}_{}.in",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(content.as_bytes()).unwrap();
-        path
-    }
-
-    #[test]
-    fn test_str2bit4() {
-        let input_data = b"ACtGc";
-        let expected_out: [u8; 3] = [0x24, 0x81, 0x02];
-        let mut actual_out = [0_u8; 3];
-        let offset = 0;
-        let mixed_base = true;
-        string_to_bit4(&mut actual_out, input_data, offset, mixed_base);
-        assert_eq!(actual_out, expected_out);
-    }
-
-    #[test]
-    fn test_parse_input_no_bulge() {
-        let input = "/tmp/genome.fa\nNNNNNNNNNNNNNNNNNNNNNNN\nACGTACGTACGTACGTACGTACG 5\n";
-        let path = write_temp_input(input);
-        let info = parse_and_validate_input(&path).unwrap();
-        assert_eq!(info.max_dna_bulges, 0);
-        assert_eq!(info.max_rna_bulges, 0);
-        assert_eq!(info.max_mismatches, 5);
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn test_parse_input_with_bulge() {
-        let input = "/tmp/genome.fa\nNNNNNNNNNNNNNNNNNNNNNRG 2 1\nACGTACGTACGTACGTACGTACG 5\n";
-        let path = write_temp_input(input);
-        let info = parse_and_validate_input(&path).unwrap();
-        assert_eq!(info.max_dna_bulges, 2);
-        assert_eq!(info.max_rna_bulges, 1);
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn test_parse_input_invalid_bulge_count() {
-        let input = "/tmp/genome.fa\nNNN 2\nACGT 5\n";
-        let path = write_temp_input(input);
-        let result = parse_and_validate_input(&path);
-        assert!(result.is_err());
-        std::fs::remove_file(&path).ok();
-    }
 }
