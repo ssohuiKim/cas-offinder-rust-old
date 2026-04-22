@@ -67,6 +67,7 @@ const GPU_BLOCK_SIZE: usize = 4;
 const PATTERN_CHUNK_SIZE: usize = 16;
 const CL_BLOCKS_PER_EXEC: usize = 4;
 
+#[derive(Clone)]
 struct SearchChunkMeta {
     pub chr_names: Vec<String>,
     // start and end of data within chromosome, by nucleotide
@@ -1139,85 +1140,118 @@ unsafe fn search_device_ocl_myers(
         let n_active_nucl: u32 = item.meta.chunk_byte_offsets[n_chunks] as u32 * 2;
         let n_write_bytes = *item.meta.chunk_byte_offsets.last().unwrap() as usize;
 
-        let write_event = queue.enqueue_write_buffer(
+        let _write_event = queue.enqueue_write_buffer(
             &mut genome_buf,
-            CL_NO_BLOCK,
+            CL_BLOCK,
             0,
             &item.data[..n_write_bytes],
             &[],
         )?;
-        let clear_count_event =
-            queue.enqueue_write_buffer(&mut out_count, CL_NO_BLOCK, 0, &[0u32], &[])?;
 
-        let kernel_event = kernel::ExecuteKernel::new(&kernel)
-            .set_arg(&genome_buf)
-            .set_arg(&peq_buf)
-            .set_arg(&pattern_buf)
-            .set_arg(&pam_off_buf)
-            .set_arg(&pam_filt_buf)
-            .set_arg(&n_patterns)
-            .set_arg(&_n_fwd_patterns)
-            .set_arg(&active_start_nucl)
-            .set_arg(&n_active_nucl)
-            .set_arg(&out_buf)
-            .set_arg(&out_count)
-            .set_global_work_sizes(&[n_active_nucl as usize, n_patterns as usize])
-            .set_wait_event(&write_event)
-            .set_wait_event(&clear_count_event)
-            .enqueue_nd_range(&queue)?;
+        // Launch the kernel over a shrinking stack of sub-ranges. Each
+        // sub-range runs independently against `out_buf`; if the atomic
+        // write counter exceeds `out_buf_size` we know the kernel dropped
+        // matches past that index, so we bisect the range and re-enqueue
+        // the two halves. Sub-ranges that fit emit their matches straight
+        // into the streaming pipeline — `raw_matches`, the decoded Vecs
+        // and the produced `Match` list are bounded by `out_buf_size`,
+        // not by the whole-batch candidate count, so peak memory stays
+        // roughly constant regardless of db/rb/PAM selectivity.
+        let mut total_emitted = 0usize;
+        let mut pending: Vec<(u32, u32)> = vec![(active_start_nucl, n_active_nucl)];
+        while let Some((sub_start, sub_end)) = pending.pop() {
+            if sub_start >= sub_end {
+                continue;
+            }
+            let clear_count_event =
+                queue.enqueue_write_buffer(&mut out_count, CL_NO_BLOCK, 0, &[0u32], &[])?;
 
-        let mut readsize_buf = [0u32; 1];
-        queue.enqueue_read_buffer(
-            &out_count,
-            CL_BLOCK,
-            0,
-            &mut readsize_buf,
-            &[kernel_event.get()],
-        )?;
-        let total_found = readsize_buf[0] as usize;
-        if total_found > out_buf_size {
-            panic!(
-                "GPU match buffer overflow: {} candidates exceeds out_buf_size={}. \
-                 Reduce SEARCH_CHUNK_NUCL or increase the output buffer budget.",
-                total_found, out_buf_size
-            );
+            let kernel_event = kernel::ExecuteKernel::new(&kernel)
+                .set_arg(&genome_buf)
+                .set_arg(&peq_buf)
+                .set_arg(&pattern_buf)
+                .set_arg(&pam_off_buf)
+                .set_arg(&pam_filt_buf)
+                .set_arg(&n_patterns)
+                .set_arg(&_n_fwd_patterns)
+                .set_arg(&active_start_nucl)
+                .set_arg(&n_active_nucl)
+                .set_arg(&out_buf)
+                .set_arg(&out_count)
+                .set_global_work_offsets(&[sub_start as usize, 0])
+                .set_global_work_sizes(&[(sub_end - sub_start) as usize, n_patterns as usize])
+                .set_wait_event(&clear_count_event)
+                .enqueue_nd_range(&queue)?;
+
+            let mut readsize_buf = [0u32; 1];
+            queue.enqueue_read_buffer(
+                &out_count,
+                CL_BLOCK,
+                0,
+                &mut readsize_buf,
+                &[kernel_event.get()],
+            )?;
+            let total_found = readsize_buf[0] as usize;
+
+            if total_found > out_buf_size {
+                // Kernel overflowed this sub-range; bisect and retry. The
+                // matches written so far are incomplete (some were dropped
+                // past OUT_BUF_SIZE) so we discard and re-run the two
+                // halves separately.
+                let mid = sub_start + (sub_end - sub_start) / 2;
+                if mid == sub_start || mid == sub_end {
+                    panic!(
+                        "GPU match buffer overflow on minimal sub-range \
+                         [{sub_start}, {sub_end}): {} candidates > {}. \
+                         Increase out_buf_size.",
+                        total_found, out_buf_size
+                    );
+                }
+                // LIFO: push the right half first so the left runs next.
+                pending.push((mid, sub_end));
+                pending.push((sub_start, mid));
+                continue;
+            }
+            if total_found == 0 {
+                continue;
+            }
+
+            let mut raw_matches: Vec<GpuEnumMatch> =
+                vec![GpuEnumMatch::default(); total_found];
+            queue.enqueue_read_buffer(&out_buf, CL_BLOCK, 0, &mut raw_matches[..], &[])?;
+
+            use rayon::prelude::*;
+            let decoded: Vec<(SearchMatch, MyersAlignment)> = raw_matches
+                .par_iter()
+                .filter_map(|raw| {
+                    let pattern_ascii = &patterns_ascii[raw.pattern_idx as usize];
+                    decode_gpu_enum_match(raw, &item.data[..], pattern_ascii)
+                })
+                .collect();
+            // Free the raw buffer before the unzip allocations.
+            drop(raw_matches);
+            let (final_matches, alignments): (Vec<_>, Vec<_>) = decoded.into_iter().unzip();
+            total_emitted += final_matches.len();
+
+            dest.send(SearchChunkResultMyers {
+                matches: final_matches,
+                alignments,
+                meta: item.meta.clone(),
+            })
+            .unwrap();
         }
-        let readsize = total_found;
 
-        if readsize == 0 {
+        // The downstream converter uses `meta.has_overlap_tail` etc. per
+        // partial. A batch that yielded zero matches still needs at least
+        // one empty partial so the writer's bookkeeping lines up.
+        if total_emitted == 0 {
             dest.send(SearchChunkResultMyers {
                 matches: Vec::new(),
                 alignments: Vec::new(),
                 meta: item.meta,
             })
             .unwrap();
-            continue;
         }
-
-        let mut raw_matches: Vec<GpuEnumMatch> =
-            vec![GpuEnumMatch::default(); readsize];
-        queue.enqueue_read_buffer(&out_buf, CL_BLOCK, 0, &mut raw_matches[..], &[])?;
-
-        // Host post-process: decode packed ops into aligned strings by
-        // reading nibbles directly from the bit4 genome buffer and converting
-        // per char via bit4_to_char. No upfront ASCII decode of the whole
-        // chunk — saves ~active_nucl bytes of memory and the decode pass.
-        use rayon::prelude::*;
-        let decoded: Vec<(SearchMatch, MyersAlignment)> = raw_matches
-            .par_iter()
-            .filter_map(|raw| {
-                let pattern_ascii = &patterns_ascii[raw.pattern_idx as usize];
-                decode_gpu_enum_match(raw, &item.data[..], pattern_ascii)
-            })
-            .collect();
-        let (final_matches, alignments): (Vec<_>, Vec<_>) = decoded.into_iter().unzip();
-
-        dest.send(SearchChunkResultMyers {
-            matches: final_matches,
-            alignments,
-            meta: item.meta,
-        })
-        .unwrap();
     }
     Ok(())
 }
@@ -1294,13 +1328,12 @@ fn search_chunk_ocl_myers(
 
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
     let text_window = pattern_len + max_dna_bulges as usize;
-    // Match buffer sized to the search chunk: one candidate slot per 8
-    // genome nucleotides. With a typical PAM selectivity of ~1/16 this
-    // leaves ~2x headroom before the kernel's silent drop-on-overflow
-    // would kick in (we also panic on overflow below).
-    let out_buf_size: usize = (search_chunk_nucl() / 8)
-        .max(1 << 22)
-        .min(1 << 28);
+    // Small, fixed output buffer. Kernel launches are split into sub-ranges
+    // at runtime (see search_device_ocl_myers) — on overflow the sub-range
+    // is bisected and re-launched, so we don't need to size for the worst
+    // case. 4 M slots * 32 B = 128 MB on the GPU and ~128 MB host raw
+    // buffer, independent of db/rb/PAM selectivity.
+    let out_buf_size: usize = 4 * 1024 * 1024;
     let compile_defs = format!(
         " -DPATTERN_LEN={} -DPAM_LEN={} -DMAX_EDITS={} -DMAX_MISMATCHES={} -DMAX_DNA_BULGES={} -DMAX_RNA_BULGES={} -DTEXT_WINDOW={} -DOUT_BUF_SIZE={}",
         pattern_len,
