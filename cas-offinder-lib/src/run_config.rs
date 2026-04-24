@@ -1,9 +1,18 @@
-use opencl3::*;
-use std::thread;
-pub struct OclRunConfig {
-    devices: Vec<(platform::Platform, Vec<device::Device>)>,
-}
+//! Runtime device configuration for the CUDA port.
+//!
+//! The legacy OpenCL implementation distinguished CPU / GPU / Accelerator
+//! platforms at the OpenCL level. CUDA only exposes NVIDIA GPUs, so the
+//! available choices collapse to "use the CPU fallback" vs "use the CUDA
+//! GPUs discovered on this host".
 
+use cudarc::driver::CudaContext;
+use std::sync::Arc;
+use std::thread;
+
+/// Selection passed by the CLI. `Cpu` runs the pure-Rust CPU pipeline;
+/// `Gpu`/`Accel`/`All` all route to CUDA devices (CUDA has no concept of
+/// non-GPU accelerators so those aliases just map to GPU here for backward
+/// compatibility with the original CLI argument set).
 pub enum OclDeviceType {
     CPU,
     GPU,
@@ -11,43 +20,39 @@ pub enum OclDeviceType {
     ALL,
 }
 
-fn to_system_type(ty: OclDeviceType) -> u64 {
-    match ty {
-        OclDeviceType::CPU => device::CL_DEVICE_TYPE_CPU,
-        OclDeviceType::GPU => device::CL_DEVICE_TYPE_GPU,
-        OclDeviceType::ACCEL => device::CL_DEVICE_TYPE_ACCELERATOR,
-        OclDeviceType::ALL => device::CL_DEVICE_TYPE_ALL,
-    }
-}
-
-pub fn get_avali_ocl_devices(
-    ty: OclDeviceType,
-) -> Result<Vec<(platform::Platform, Vec<device::Device>)>> {
-    let mut devices: Vec<(platform::Platform, Vec<device::Device>)> = Vec::new();
-    let sys_ty = to_system_type(ty);
-    let platforms = platform::get_platforms()?;
-    for plat in platforms {
-        devices.push((
-            plat,
-            plat.get_devices(sys_ty)?
-                .iter()
-                .copied()
-                .map(device::Device::new)
-                .collect(),
-        ));
-    }
-    Ok(devices)
+/// Holds one primary context per CUDA-visible GPU. When `contexts` is empty
+/// the caller falls back to the CPU implementation (either the user asked
+/// for `C` or no CUDA devices were found).
+pub struct OclRunConfig {
+    contexts: Vec<Arc<CudaContext>>,
 }
 
 impl OclRunConfig {
-    pub fn new(ty: OclDeviceType) -> Result<OclRunConfig> {
-        Ok(OclRunConfig {
-            devices: get_avali_ocl_devices(ty)?,
-        })
+    pub fn new(ty: OclDeviceType) -> Result<Self, Box<dyn std::error::Error>> {
+        let contexts = match ty {
+            OclDeviceType::CPU => Vec::new(),
+            OclDeviceType::GPU | OclDeviceType::ACCEL | OclDeviceType::ALL => {
+                let n = CudaContext::device_count().unwrap_or(0).max(0) as usize;
+                let mut v = Vec::with_capacity(n);
+                for i in 0..n {
+                    if let Ok(ctx) = CudaContext::new(i) {
+                        v.push(ctx);
+                    }
+                }
+                v
+            }
+        };
+        Ok(Self { contexts })
     }
+
     pub fn is_empty(&self) -> bool {
-        self.devices.iter().all(|(_, devs)| devs.is_empty())
+        self.contexts.is_empty()
     }
+
+    pub fn contexts(&self) -> &[Arc<CudaContext>] {
+        &self.contexts
+    }
+
     pub fn get_device_strs(&self) -> Vec<String> {
         if self.is_empty() {
             let n_threads: usize = thread::available_parallelism().unwrap().into();
@@ -56,14 +61,14 @@ impl OclRunConfig {
                 n_threads
             )]
         } else {
-            self.devices
+            self.contexts
                 .iter()
-                .flat_map(|(_, devs)| devs.iter())
-                .map(|d| d.name().unwrap())
+                .enumerate()
+                .map(|(i, ctx)| {
+                    ctx.name()
+                        .unwrap_or_else(|_| format!("CUDA device {}", i))
+                })
                 .collect()
         }
-    }
-    pub fn get(&self) -> &Vec<(platform::Platform, Vec<device::Device>)> {
-        &self.devices
     }
 }
