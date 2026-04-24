@@ -1127,6 +1127,7 @@ fn search_device_cuda_myers(
             launch.arg(&n_patterns);
             launch.arg(&n_fwd_patterns);
             launch.arg(&sub_start);
+            launch.arg(&sub_end);
             launch.arg(&active_start_nucl);
             launch.arg(&n_active_nucl);
             launch.arg(&out_buf);

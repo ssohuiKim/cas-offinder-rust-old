@@ -9,10 +9,13 @@
 //   atomic_inc(ptr)   → atomicAdd(ptr, 1)   (same "return old value" semantics)
 //   min(a, b)         → integer_min() below (avoids pulling in <algorithm>)
 //
-// One extra argument vs the OpenCL version: `j_start`. OpenCL's
+// Two extra arguments vs the OpenCL version: `j_start` and `j_end`. OpenCL's
 // clEnqueueNDRangeKernel takes a per-kernel global work offset; CUDA has no
 // equivalent, so host code launches grids sized for the sub-range and passes
-// the offset explicitly.
+// the offset explicitly. CUDA also rounds the grid up to a whole block, so
+// `j_end` is needed to reject the padding threads that would otherwise
+// re-process j values belonging to the *next* sub-range (producing duplicate
+// emissions at bisection boundaries).
 //
 // Compile-time defines injected by build.rs/nvcc:
 //   PATTERN_LEN, PAM_LEN, MAX_EDITS, MAX_MISMATCHES, MAX_DNA_BULGES,
@@ -116,6 +119,7 @@ extern "C" __global__ void find_matches_myers(
     uint32_t n_patterns,
     uint32_t n_fwd_patterns,
     uint32_t j_start,                // sub-range offset (replaces OpenCL global_work_offset)
+    uint32_t j_end,                  // sub-range upper bound (excludes grid-padding threads)
     uint32_t active_start_nucl,
     uint32_t total_nucl,
     s_match* __restrict__ out_matches,
@@ -125,6 +129,7 @@ extern "C" __global__ void find_matches_myers(
     uint32_t p = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (p >= n_patterns) return;
+    if (j >= j_end) return;
     if (j >= total_nucl) return;
     if (j < active_start_nucl) return;
     if (j + 1 < PATTERN_LEN) return;
@@ -291,7 +296,7 @@ extern "C" __global__ void find_matches_myers(
                         uint8_t gb4 = get_bit4(genome_bit4, match_start + g_off);
                         uint32_t k = pi_fwd - pam_off;
                         uint8_t f = pam_filters_bit4[p * PAM_LEN + k];
-                        if ((gb4 & f) == 0) { pam_ok_full = false; break; }
+                        if (!pam_cell_ok(gb4, f)) { pam_ok_full = false; break; }
                     }
                     pi_fwd++; g_off++;
                 } else if (op == OP_DNA) {
