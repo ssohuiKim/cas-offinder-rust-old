@@ -1,16 +1,19 @@
-use opencl3::*;
-// use cl3
 use crate::bit4ops::{cdiv, roundup};
 use crate::run_config::*;
 use crate::{bit4_to_string, chrom_chunk::*, reverse_compliment_char_i};
-use opencl3::Result;
-use std::ptr::null_mut;
+use cudarc::driver::{CudaContext, CudaSlice, DriverError, LaunchConfig, PushKernelArg};
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-pub const KERNEL_CONTENTS: &str = include_str!("./kernel.cl");
-pub const KERNEL_MYERS_CONTENTS: &str = include_str!("./kernel_myers.cl");
+pub const KERNEL_CONTENTS: &str = include_str!("./kernel.cu");
+pub const KERNEL_MYERS_CONTENTS: &str = include_str!("./kernel_myers.cu");
+
+/// Convenience alias so the rest of this module keeps reading like the
+/// former OpenCL port (`fn foo(...) -> Result<T>`). CUDA errors all funnel
+/// through cudarc's `DriverError`.
+pub type Result<T> = std::result::Result<T, DriverError>;
 
 // Search chunk size (nucleotides per GPU batch) is chosen at runtime based on
 // available device memory — see [`init_search_chunk_nucl`]. The default below
@@ -34,31 +37,15 @@ fn chunks_per_search() -> usize {
     search_chunk_nucl() / CHUNK_SIZE
 }
 
-/// Set the search chunk size based on the largest OpenCL device's memory budget.
-/// Picks ~1/4 of CL_DEVICE_MAX_MEM_ALLOC_SIZE per device (leaving room for the
-/// output/PEQ/PAM buffers), rounded down to a multiple of CHUNK_SIZE, and
-/// clamped to [DEFAULT_SEARCH_CHUNK_SIZE, MAX_SEARCH_CHUNK_SIZE].
+/// Set the search chunk size when a CUDA device is available. RTX 4090 /
+/// RTX 5090 class GPUs have plenty of VRAM (>= 24 GB), so we just pin the
+/// per-batch genome buffer at 1 Gnt (= 512 MB bit4-packed). CPU-only runs
+/// keep the default.
 pub fn init_search_chunk_nucl_from_devices(devices: &OclRunConfig) {
-    let mut best_bytes: u64 = 0;
-    for (_, devs) in devices.get().iter() {
-        for d in devs {
-            if let Ok(alloc_bytes) = d.max_mem_alloc_size() {
-                if alloc_bytes > best_bytes {
-                    best_bytes = alloc_bytes;
-                }
-            }
-        }
-    }
-    if best_bytes == 0 {
-        // No devices (CPU-only run) — keep default.
+    if devices.is_empty() {
         return;
     }
-    // Budget per genome buffer: 1/4 of max_alloc, bit4-packed (2 nucl/byte).
-    let budget_bytes = (best_bytes / 4) as usize;
-    let nucl_budget = budget_bytes.saturating_mul(2);
-    // Round down to CHUNK_SIZE multiple.
-    let mut size = (nucl_budget / CHUNK_SIZE) * CHUNK_SIZE;
-    size = size.clamp(DEFAULT_SEARCH_CHUNK_SIZE, MAX_SEARCH_CHUNK_SIZE);
+    let size = MAX_SEARCH_CHUNK_SIZE;
     SEARCH_CHUNK_NUCL.store(size, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -103,7 +90,7 @@ struct SearchChunkResult {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct SearchMatch {
     pub chunk_idx: u32,
     pub pattern_idx: u32,
@@ -111,6 +98,9 @@ struct SearchMatch {
     pub dna_bulge_size: u16,
     pub rna_bulge_size: u16,
 }
+
+unsafe impl cudarc::driver::DeviceRepr for SearchMatch {}
+unsafe impl cudarc::driver::ValidAsZeroBits for SearchMatch {}
 
 /// GPU-side output of the Myers+DP+traceback kernel. Each record carries
 /// the aligned ops packed as 2 bits per op (LSB = first op emitted during
@@ -137,6 +127,11 @@ struct GpuEnumMatch {
     pub ops_count: u32,
     pub _pad: u32,
 }
+
+// `#[repr(C)]` + no padding issues on the fields we care about → safe to
+// hand to cudarc as a POD device element.
+unsafe impl cudarc::driver::DeviceRepr for GpuEnumMatch {}
+unsafe impl cudarc::driver::ValidAsZeroBits for GpuEnumMatch {}
 
 const GPU_OP_MATCH: u8 = 0;
 const GPU_OP_SUB: u8 = 1;
@@ -210,140 +205,121 @@ fn decode_gpu_enum_match(
     ))
 }
 
-const MAX_QUEUED: usize = 1;
-unsafe fn create_ocl_buf<T>(context: &context::Context, size: usize) -> Result<memory::Buffer<T>> {
-    memory::Buffer::create(context, memory::CL_MEM_READ_WRITE, size, null_mut())
+/// nvrtc JIT doesn't search host include paths by default, so pull the CUDA
+/// SDK include directory from whatever env var points at the toolkit root.
+/// The .cu kernels need this to resolve `<cstdint>`.
+fn nvrtc_sysroot_includes() -> Vec<String> {
+    let root = std::env::var("CUDA_PATH")
+        .or_else(|_| std::env::var("CUDA_HOME"))
+        .or_else(|_| std::env::var("CUDA_ROOT"))
+        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    // conda-forge cuda-toolkit installs headers at $CUDA_PATH/targets/.../include;
+    // standard installs also have $CUDA_PATH/include. Feed both.
+    vec![
+        format!("-I{}/targets/x86_64-linux/include", root),
+        format!("-I{}/include", root),
+    ]
 }
-unsafe fn create_ocl_bufs<T>(
-    context: &context::Context,
-    size: usize,
-) -> Result<[memory::Buffer<T>; MAX_QUEUED]> {
-    Ok([
-        create_ocl_buf::<T>(context, size)?,
-        // create_ocl_buf::<T>(&context,size)?
-    ])
+
+/// Compile-time defines for the legacy popcount kernel. `block_ty` picks the
+/// lane width used by the bit-parallel popcount; 32-bit is the efficient
+/// choice on NVIDIA GPUs.
+fn get_compile_defs(pattern_len: usize) -> Vec<String> {
+    let mut out = nvrtc_sysroot_includes();
+    out.extend([
+        format!("-DPATTERN_LEN={}", pattern_len),
+        format!("-DBLOCKS_PER_EXEC={}", CL_BLOCKS_PER_EXEC),
+        format!("-DPATTERN_CHUNK_SIZE={}", PATTERN_CHUNK_SIZE),
+        "-Dblock_ty=uint32_t".to_string(),
+    ]);
+    out
 }
-fn is_gpu(dev: &device::Device) -> Result<bool> {
-    Ok(dev.dev_type()? == device::CL_DEVICE_TYPE_GPU)
+
+/// 2D launch config: grid_dim.x covers `n` work items in `BLOCK_X`-sized
+/// blocks, grid_dim.y iterates over `m` patterns one per block-y.
+fn launch_cfg_2d(n: u32, m: u32) -> LaunchConfig {
+    const BLOCK_X: u32 = 128;
+    LaunchConfig {
+        grid_dim: ((n + BLOCK_X - 1) / BLOCK_X, m.max(1), 1),
+        block_dim: (BLOCK_X, 1, 1),
+        shared_mem_bytes: 0,
+    }
 }
-fn prefered_block_size(dev: &device::Device) -> Result<usize> {
-    Ok(if is_gpu(dev)? {
-        GPU_BLOCK_SIZE
-    } else {
-        CPU_BLOCK_SIZE
-    })
-}
-// fn get_prog_args(pattern_len:)
-fn search_device_ocl(
+
+fn search_device_cuda(
     max_mismatches: u32,
     pattern_len: usize,
     patterns: Arc<Vec<u8>>,
-    context: Arc<context::Context>,
-    program: Arc<program::Program>,
-    dev: Arc<device::Device>,
+    ctx: Arc<CudaContext>,
+    ptx_source: Arc<String>,
     recv: crossbeam_channel::Receiver<SearchChunkInfo>,
     dest: mpsc::SyncSender<SearchChunkResult>,
 ) -> Result<()> {
-    unsafe {
-        const OUT_BUF_SIZE: usize = 1 << 22;
-        const CL_BLOCK: u32 = 1;
-        const CL_NO_BLOCK: u32 = 0;
-        let queue = command_queue::CommandQueue::create(&context, dev.id(), 0)?;
-        let kernel = kernel::Kernel::create(&program, "find_matches")?;
-        let mut genome_bufs = create_ocl_bufs::<u8>(&context, search_chunk_bytes())?;
-        let mut out_counts = create_ocl_bufs::<u32>(&context, 1)?;
-        let mut out_bufs = create_ocl_bufs::<SearchMatch>(&context, OUT_BUF_SIZE)?;
-        let mut pattern_buf = create_ocl_buf::<u8>(&context, patterns.len())?;
-        queue.enqueue_write_buffer(&mut pattern_buf, CL_BLOCK, 0, &patterns, &[])?;
-        let pattern_blocked_size = roundup(cdiv(pattern_len, 2), PATTERN_CHUNK_SIZE);
-        assert!(patterns.len() % pattern_blocked_size == 0);
-        let n_patterns = patterns.len() / pattern_blocked_size;
-        for mut item in recv.iter() {
-            // Zero out genome 'N' (bit4=0xF) for popcount semantics. See the
-            // comment on mask_genome_n_to_zero_inplace in search_device_cpu_thread.
-            mask_genome_n_to_zero_inplace(&mut item.data);
-            let total_chunks = item.meta.chr_names.len();
-            let n_chunks = if item.meta.has_overlap_tail {
-                total_chunks - 1
-            } else {
-                total_chunks
-            };
-            let n_genome_bytes = item.meta.chunk_byte_offsets[n_chunks] as usize;
-            let n_total_bytes =
-                *item.meta.chunk_byte_offsets.last().unwrap() as usize;
-            let n_genome_blocks = n_genome_bytes / prefered_block_size(&dev)?;
-            let n_genome_execs = n_genome_blocks / CL_BLOCKS_PER_EXEC;
-            let match_start_min_nucl: u32 =
-                legacy_match_start_min_nucl(&item.meta, pattern_len);
-            let cur_genome_buf = &mut genome_bufs[0];
-            let cur_size_buf = &mut out_counts[0];
-            let cur_out_buf = &mut out_bufs[0];
-            let write_event = queue.enqueue_write_buffer(
-                cur_genome_buf,
-                CL_NO_BLOCK,
-                0,
-                &item.data[..n_total_bytes],
-                &[],
-            )?;
-            let clear_count_event =
-                queue.enqueue_write_buffer(cur_size_buf, CL_NO_BLOCK, 0, &[0], &[])?;
+    const OUT_BUF_SIZE: usize = 1 << 22;
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(cudarc::nvrtc::Ptx::from_src(ptx_source.as_str()))?;
+    let kernel = module.load_function("find_matches")?;
 
-            let kernel_event = kernel::ExecuteKernel::new(&kernel)
-                .set_arg(cur_genome_buf)
-                .set_arg(&pattern_buf)
-                .set_arg(&max_mismatches)
-                .set_arg(&match_start_min_nucl)
-                .set_arg(cur_out_buf)
-                .set_arg(cur_size_buf)
-                .set_global_work_sizes(&[n_genome_execs, n_patterns])
-                .set_wait_event(&write_event)
-                .set_wait_event(&clear_count_event)
-                .enqueue_nd_range(&queue)?;
-            let mut readsize_buf = [0];
-            queue.enqueue_read_buffer(
-                cur_size_buf,
-                CL_BLOCK,
-                0,
-                &mut readsize_buf,
-                &[kernel_event.get()],
-            )?;
-            let readsize = readsize_buf[0];
-            if readsize != 0 {
-                let mut outvec: Vec<SearchMatch> = vec![
-                    SearchMatch {
-                        chunk_idx: 0,
-                        pattern_idx: 0,
-                        mismatches: 0,
-                        dna_bulge_size: 0,
-                        rna_bulge_size: 0,
-                    };
-                    readsize as usize
-                ];
-                queue.enqueue_read_buffer(cur_out_buf, CL_BLOCK, 0, &mut outvec[..], &[])?;
-                dest.send(SearchChunkResult {
-                    matches: outvec,
-                    meta: item.meta,
-                    data: item.data,
-                })
-                .unwrap();
-            }
+    let mut genome_buf: CudaSlice<u8> = stream.alloc_zeros(search_chunk_bytes())?;
+    let mut out_count: CudaSlice<i32> = stream.alloc_zeros(1)?;
+    let out_buf: CudaSlice<SearchMatch> = stream.alloc_zeros(OUT_BUF_SIZE)?;
+    let pattern_buf: CudaSlice<u8> = stream.memcpy_stod(patterns.as_slice())?;
+
+    let pattern_blocked_size = roundup(cdiv(pattern_len, 2), PATTERN_CHUNK_SIZE);
+    assert!(patterns.len() % pattern_blocked_size == 0);
+    let n_patterns = patterns.len() / pattern_blocked_size;
+
+    for mut item in recv.iter() {
+        mask_genome_n_to_zero_inplace(&mut item.data);
+        let total_chunks = item.meta.chr_names.len();
+        let n_chunks = if item.meta.has_overlap_tail {
+            total_chunks - 1
+        } else {
+            total_chunks
+        };
+        let n_genome_bytes = item.meta.chunk_byte_offsets[n_chunks] as usize;
+        let n_total_bytes = *item.meta.chunk_byte_offsets.last().unwrap() as usize;
+        // block_ty = uint32_t → 4 bytes per block.
+        let n_genome_blocks = n_genome_bytes / GPU_BLOCK_SIZE;
+        let n_genome_execs = n_genome_blocks / CL_BLOCKS_PER_EXEC;
+        let match_start_min_nucl: u32 =
+            legacy_match_start_min_nucl(&item.meta, pattern_len);
+
+        stream.memcpy_htod(&item.data[..n_total_bytes], &mut genome_buf)?;
+        let zero: [i32; 1] = [0];
+        stream.memcpy_htod(&zero, &mut out_count)?;
+
+        let n_execs_u32 = n_genome_execs as u32;
+        let n_patterns_u32 = n_patterns as u32;
+        let cfg = launch_cfg_2d(n_execs_u32, n_patterns_u32);
+        let mut launch = stream.launch_builder(&kernel);
+        launch.arg(&genome_buf);
+        launch.arg(&pattern_buf);
+        launch.arg(&max_mismatches);
+        launch.arg(&match_start_min_nucl);
+        launch.arg(&n_execs_u32);
+        launch.arg(&n_patterns_u32);
+        launch.arg(&out_buf);
+        launch.arg(&out_count);
+        unsafe { launch.launch(cfg) }?;
+
+        let count_vec = stream.memcpy_dtov(&out_count)?;
+        let readsize = count_vec[0].max(0) as usize;
+        if readsize > 0 {
+            let read_slice = out_buf.slice(..readsize);
+            let outvec = stream.memcpy_dtov(&read_slice)?;
+            dest.send(SearchChunkResult {
+                matches: outvec,
+                meta: item.meta,
+                data: item.data,
+            })
+            .unwrap();
         }
     }
     Ok(())
 }
-fn prefered_block_type(dev: &device::Device) -> Result<&str> {
-    Ok(if is_gpu(dev)? { "uint32_t" } else { "uint64_t" })
-}
-fn get_compile_defs(pattern_len: usize, block_ty: &str) -> String {
-    format!(
-        " -DPATTERN_LEN={}
-     -DBLOCKS_PER_EXEC={}
-     -DPATTERN_CHUNK_SIZE={}
-     -Dblock_ty={}",
-        pattern_len, CL_BLOCKS_PER_EXEC, PATTERN_CHUNK_SIZE, block_ty
-    )
-}
-fn search_chunk_ocl(
+
+fn search_chunk_cuda(
     devices: OclRunConfig,
     max_mismatches: u32,
     pattern_len: usize,
@@ -351,57 +327,37 @@ fn search_chunk_ocl(
     recv: crossbeam_channel::Receiver<SearchChunkInfo>,
     dest: mpsc::SyncSender<SearchChunkResult>,
 ) -> Result<()> {
-    /* divies off work to opencl devices */
     let pattern_arc = Arc::new(pack_patterns(patterns));
-    // let devices = get_all_devices()?;
-    // assert!(devices.len()>0, "Needs at least one opencl device to run tests!");
-    let mut threads: Vec<JoinHandle<Result<()>>> = Vec::new();
-    for (_, devs) in devices.get().iter() {
-        let plat_devs: Vec<*mut std::ffi::c_void> = devs.iter().map(|d| d.id()).collect();
-        if !plat_devs.is_empty() {
-            let context = Arc::new(context::Context::from_devices(
-                &plat_devs,
-                &[0],
-                None,
-                null_mut(),
-            )?);
-            let p_devices: Vec<Arc<device::Device>> = plat_devs
-                .iter()
-                .map(|d| Arc::new(device::Device::new(*d)))
-                .collect();
-            let prog_options = get_compile_defs(pattern_len, prefered_block_type(&p_devices[0])?);
-            let program = Arc::new(
-                program::Program::create_and_build_from_source(
-                    &context,
-                    KERNEL_CONTENTS,
-                    &prog_options,
-                )
-                .map_err(|err| {
-                    eprintln!("{}", err);
-                })
-                .unwrap(),
-            );
+    // Compile the .cu source once with runtime nvrtc (pattern_len etc. are
+    // baked in as -D defines); every device re-uses the same PTX.
+    let defs = get_compile_defs(pattern_len);
+    let opts = CompileOptions {
+        options: defs,
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(KERNEL_CONTENTS, opts)
+        .expect("nvrtc failed to compile kernel.cu");
+    // cudarc's `Ptx::from_src(&str)` takes the PTX text directly, so keep
+    // the compiled text around as a shared string.
+    let ptx_source = Arc::new(ptx.to_src().to_string());
 
-            for p_dev in p_devices {
-                let t_dest = dest.clone();
-                let t_recv = recv.clone();
-                let t_context = context.clone();
-                let t_prog = program.clone();
-                let t_pattern = pattern_arc.clone();
-                threads.push(thread::spawn(move || {
-                    search_device_ocl(
-                        max_mismatches,
-                        pattern_len,
-                        t_pattern,
-                        t_context,
-                        t_prog,
-                        p_dev,
-                        t_recv,
-                        t_dest,
-                    )
-                }));
-            }
-        }
+    let mut threads: Vec<JoinHandle<Result<()>>> = Vec::new();
+    for ctx in devices.contexts().iter().cloned() {
+        let t_dest = dest.clone();
+        let t_recv = recv.clone();
+        let t_pattern = pattern_arc.clone();
+        let t_ptx = ptx_source.clone();
+        threads.push(thread::spawn(move || {
+            search_device_cuda(
+                max_mismatches,
+                pattern_len,
+                t_pattern,
+                ctx,
+                t_ptx,
+                t_recv,
+                t_dest,
+            )
+        }));
     }
     for t in threads {
         t.join().unwrap()?;
@@ -1095,45 +1051,33 @@ fn build_peq_array(peqs: &[crate::myers::PeqTable]) -> Vec<u64> {
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn search_device_ocl_myers(
-    _max_mismatches: u32,
-    _max_dna_bulges: u32,
-    _max_rna_bulges: u32,
+fn search_device_cuda_myers(
     peq_array: Arc<Vec<u64>>,
     pattern_bit4_flat: Arc<Vec<u8>>,
     pam_offsets_gpu: Arc<Vec<u8>>,
     pam_filters_flat_gpu: Arc<Vec<u8>>,
     n_patterns: u32,
-    _n_fwd_patterns: u32,
+    n_fwd_patterns: u32,
     patterns_ascii: Arc<Vec<Vec<u8>>>,
-    context: Arc<context::Context>,
-    program: Arc<program::Program>,
-    _dev: Arc<device::Device>,
+    ctx: Arc<CudaContext>,
+    ptx_source: Arc<String>,
     recv: crossbeam_channel::Receiver<SearchChunkInfo>,
     dest: mpsc::SyncSender<SearchChunkResultMyers>,
     out_buf_size: usize,
 ) -> Result<()> {
-    const CL_BLOCK: u32 = 1;
-    const CL_NO_BLOCK: u32 = 0;
+    let stream = ctx.default_stream();
+    let module = ctx.load_module(cudarc::nvrtc::Ptx::from_src(ptx_source.as_str()))?;
+    let kernel = module.load_function("find_matches_myers")?;
 
-    let queue = command_queue::CommandQueue::create(&context, _dev.id(), 0)?;
-    let kernel = kernel::Kernel::create(&program, "find_matches_myers")?;
-    let mut genome_buf = create_ocl_buf::<u8>(&context, search_chunk_bytes())?;
-    let mut out_count = create_ocl_buf::<u32>(&context, 1)?;
-    let out_buf = create_ocl_buf::<GpuEnumMatch>(&context, out_buf_size)?;
-    let mut peq_buf = create_ocl_buf::<u64>(&context, peq_array.len())?;
-    let mut pattern_buf = create_ocl_buf::<u8>(&context, pattern_bit4_flat.len())?;
-    let mut pam_off_buf = create_ocl_buf::<u8>(&context, pam_offsets_gpu.len())?;
-    let mut pam_filt_buf = create_ocl_buf::<u8>(&context, pam_filters_flat_gpu.len())?;
-    queue.enqueue_write_buffer(&mut peq_buf, CL_BLOCK, 0, &peq_array, &[])?;
-    queue.enqueue_write_buffer(&mut pattern_buf, CL_BLOCK, 0, &pattern_bit4_flat, &[])?;
-    queue.enqueue_write_buffer(&mut pam_off_buf, CL_BLOCK, 0, &pam_offsets_gpu, &[])?;
-    queue.enqueue_write_buffer(&mut pam_filt_buf, CL_BLOCK, 0, &pam_filters_flat_gpu, &[])?;
+    let mut genome_buf: CudaSlice<u8> = stream.alloc_zeros(search_chunk_bytes())?;
+    let mut out_count: CudaSlice<u32> = stream.alloc_zeros(1)?;
+    let out_buf: CudaSlice<GpuEnumMatch> = stream.alloc_zeros(out_buf_size)?;
+    let peq_buf: CudaSlice<u64> = stream.memcpy_stod(peq_array.as_slice())?;
+    let pattern_buf: CudaSlice<u8> = stream.memcpy_stod(pattern_bit4_flat.as_slice())?;
+    let pam_off_buf: CudaSlice<u8> = stream.memcpy_stod(pam_offsets_gpu.as_slice())?;
+    let pam_filt_buf: CudaSlice<u8> = stream.memcpy_stod(pam_filters_flat_gpu.as_slice())?;
 
     for item in recv.iter() {
-        // With tight packing, chunks are variable-size. `n_chunks` is the
-        // number of "active" chunks (emit matches from these). If this batch
-        // carries an overlap-tail chunk, we stop iterating before it.
         let total_chunks = item.meta.chr_names.len();
         let n_chunks = if item.meta.has_overlap_tail {
             total_chunks - 1
@@ -1148,13 +1092,7 @@ unsafe fn search_device_ocl_myers(
         let n_active_nucl: u32 = item.meta.chunk_byte_offsets[n_chunks] as u32 * 2;
         let n_write_bytes = *item.meta.chunk_byte_offsets.last().unwrap() as usize;
 
-        let _write_event = queue.enqueue_write_buffer(
-            &mut genome_buf,
-            CL_BLOCK,
-            0,
-            &item.data[..n_write_bytes],
-            &[],
-        )?;
+        stream.memcpy_htod(&item.data[..n_write_bytes], &mut genome_buf)?;
 
         // Launch the kernel over a shrinking stack of sub-ranges. Each
         // sub-range runs independently against `out_buf`; if the atomic
@@ -1171,41 +1109,34 @@ unsafe fn search_device_ocl_myers(
             if sub_start >= sub_end {
                 continue;
             }
-            let clear_count_event =
-                queue.enqueue_write_buffer(&mut out_count, CL_NO_BLOCK, 0, &[0u32], &[])?;
+            let zero: [u32; 1] = [0];
+            stream.memcpy_htod(&zero, &mut out_count)?;
 
-            let kernel_event = kernel::ExecuteKernel::new(&kernel)
-                .set_arg(&genome_buf)
-                .set_arg(&peq_buf)
-                .set_arg(&pattern_buf)
-                .set_arg(&pam_off_buf)
-                .set_arg(&pam_filt_buf)
-                .set_arg(&n_patterns)
-                .set_arg(&_n_fwd_patterns)
-                .set_arg(&active_start_nucl)
-                .set_arg(&n_active_nucl)
-                .set_arg(&out_buf)
-                .set_arg(&out_count)
-                .set_global_work_offsets(&[sub_start as usize, 0])
-                .set_global_work_sizes(&[(sub_end - sub_start) as usize, n_patterns as usize])
-                .set_wait_event(&clear_count_event)
-                .enqueue_nd_range(&queue)?;
+            let sub_len = sub_end - sub_start;
+            // Kernel's `j_start` parameter replaces OpenCL's
+            // clEnqueueNDRangeKernel global_work_offset: host launches with
+            // grid sized for the sub-range width; kernel adds `j_start` to
+            // its thread index to recover the absolute `j`.
+            let cfg = launch_cfg_2d(sub_len, n_patterns);
+            let mut launch = stream.launch_builder(&kernel);
+            launch.arg(&genome_buf);
+            launch.arg(&peq_buf);
+            launch.arg(&pattern_buf);
+            launch.arg(&pam_off_buf);
+            launch.arg(&pam_filt_buf);
+            launch.arg(&n_patterns);
+            launch.arg(&n_fwd_patterns);
+            launch.arg(&sub_start);
+            launch.arg(&active_start_nucl);
+            launch.arg(&n_active_nucl);
+            launch.arg(&out_buf);
+            launch.arg(&out_count);
+            unsafe { launch.launch(cfg) }?;
 
-            let mut readsize_buf = [0u32; 1];
-            queue.enqueue_read_buffer(
-                &out_count,
-                CL_BLOCK,
-                0,
-                &mut readsize_buf,
-                &[kernel_event.get()],
-            )?;
-            let total_found = readsize_buf[0] as usize;
+            let count_vec = stream.memcpy_dtov(&out_count)?;
+            let total_found = count_vec[0] as usize;
 
             if total_found > out_buf_size {
-                // Kernel overflowed this sub-range; bisect and retry. The
-                // matches written so far are incomplete (some were dropped
-                // past OUT_BUF_SIZE) so we discard and re-run the two
-                // halves separately.
                 let mid = sub_start + (sub_end - sub_start) / 2;
                 if mid == sub_start || mid == sub_end {
                     panic!(
@@ -1215,7 +1146,6 @@ unsafe fn search_device_ocl_myers(
                         total_found, out_buf_size
                     );
                 }
-                // LIFO: push the right half first so the left runs next.
                 pending.push((mid, sub_end));
                 pending.push((sub_start, mid));
                 continue;
@@ -1224,9 +1154,8 @@ unsafe fn search_device_ocl_myers(
                 continue;
             }
 
-            let mut raw_matches: Vec<GpuEnumMatch> =
-                vec![GpuEnumMatch::default(); total_found];
-            queue.enqueue_read_buffer(&out_buf, CL_BLOCK, 0, &mut raw_matches[..], &[])?;
+            let read_slice = out_buf.slice(..total_found);
+            let raw_matches: Vec<GpuEnumMatch> = stream.memcpy_dtov(&read_slice)?;
 
             use rayon::prelude::*;
             let decoded: Vec<(SearchMatch, MyersAlignment)> = raw_matches
@@ -1236,7 +1165,6 @@ unsafe fn search_device_ocl_myers(
                     decode_gpu_enum_match(raw, &item.data[..], pattern_ascii)
                 })
                 .collect();
-            // Free the raw buffer before the unzip allocations.
             drop(raw_matches);
             let (final_matches, alignments): (Vec<_>, Vec<_>) = decoded.into_iter().unzip();
             total_emitted += final_matches.len();
@@ -1249,9 +1177,6 @@ unsafe fn search_device_ocl_myers(
             .unwrap();
         }
 
-        // The downstream converter uses `meta.has_overlap_tail` etc. per
-        // partial. A batch that yielded zero matches still needs at least
-        // one empty partial so the writer's bookkeeping lines up.
         if total_emitted == 0 {
             dest.send(SearchChunkResultMyers {
                 matches: Vec::new(),
@@ -1264,7 +1189,7 @@ unsafe fn search_device_ocl_myers(
     Ok(())
 }
 
-fn search_chunk_ocl_myers(
+fn search_chunk_cuda_myers(
     devices: OclRunConfig,
     max_mismatches: u32,
     max_dna_bulges: u32,
@@ -1278,7 +1203,6 @@ fn search_chunk_ocl_myers(
     use crate::bit4ops::{char_to_bit4, reverse_compliment_char};
     use crate::myers::build_peq;
 
-    // Precompute shared per-pattern tables (also used by CPU post-process)
     let peqs: Vec<crate::myers::PeqTable> =
         patterns_ascii.iter().map(|p| build_peq(p)).collect();
     let pattern_is_n: Vec<Vec<bool>> = patterns_ascii
@@ -1301,13 +1225,11 @@ fn search_chunk_ocl_myers(
 
     let pam_precheck = precompute_pam_precheck(&pattern_is_n, &effective_filters_bit4);
 
-    // Flatten PAM precheck for GPU buffers
     let pam_len = pam_precheck.iter().map(|(_, f)| f.len()).max().unwrap_or(0);
     let pam_offsets_gpu: Vec<u8> = pam_precheck.iter().map(|(off, _)| *off as u8).collect();
     let mut pam_filters_flat_gpu: Vec<u8> = Vec::with_capacity(patterns_ascii.len() * pam_len);
     for (_, ref filter) in &pam_precheck {
         pam_filters_flat_gpu.extend_from_slice(filter);
-        // Pad to pam_len with 0xFF (match anything) if shorter
         for _ in filter.len()..pam_len {
             pam_filters_flat_gpu.push(0xFF);
         }
@@ -1322,7 +1244,6 @@ fn search_chunk_ocl_myers(
 
     let pattern_len = patterns_ascii[0].len();
     let pattern_bytes = (pattern_len + 1) / 2;
-    // Flatten patterns to bit4-packed form for the kernel.
     let mut pattern_bit4_flat: Vec<u8> = vec![0u8; pattern_bytes * patterns_ascii.len()];
     for (p_idx, pat) in patterns_ascii.iter().enumerate() {
         crate::string_to_bit4(
@@ -1336,79 +1257,54 @@ fn search_chunk_ocl_myers(
 
     let max_edits = max_mismatches + max_dna_bulges + max_rna_bulges;
     let text_window = pattern_len + max_dna_bulges as usize;
-    // Small, fixed output buffer. Kernel launches are split into sub-ranges
-    // at runtime (see search_device_ocl_myers) — on overflow the sub-range
-    // is bisected and re-launched, so we don't need to size for the worst
-    // case. 4 M slots * 32 B = 128 MB on the GPU and ~128 MB host raw
-    // buffer, independent of db/rb/PAM selectivity.
+    // Fixed 4 M-slot output buffer; sub-range bisect handles overflow (see
+    // search_device_cuda_myers).
     let out_buf_size: usize = 4 * 1024 * 1024;
-    let compile_defs = format!(
-        " -DPATTERN_LEN={} -DPAM_LEN={} -DMAX_EDITS={} -DMAX_MISMATCHES={} -DMAX_DNA_BULGES={} -DMAX_RNA_BULGES={} -DTEXT_WINDOW={} -DOUT_BUF_SIZE={}",
-        pattern_len,
-        pam_len,
-        max_edits,
-        max_mismatches,
-        max_dna_bulges,
-        max_rna_bulges,
-        text_window,
-        out_buf_size,
-    );
+    let mut opts_vec = nvrtc_sysroot_includes();
+    opts_vec.extend([
+        format!("-DPATTERN_LEN={}", pattern_len),
+        format!("-DPAM_LEN={}", pam_len),
+        format!("-DMAX_EDITS={}", max_edits),
+        format!("-DMAX_MISMATCHES={}", max_mismatches),
+        format!("-DMAX_DNA_BULGES={}", max_dna_bulges),
+        format!("-DMAX_RNA_BULGES={}", max_rna_bulges),
+        format!("-DTEXT_WINDOW={}", text_window),
+        format!("-DOUT_BUF_SIZE={}", out_buf_size),
+    ]);
+    let compile_opts = CompileOptions {
+        options: opts_vec,
+        ..Default::default()
+    };
+    let ptx = compile_ptx_with_opts(KERNEL_MYERS_CONTENTS, compile_opts)
+        .expect("nvrtc failed to compile kernel_myers.cu");
+    let ptx_source = Arc::new(ptx.to_src());
 
     let mut threads: Vec<JoinHandle<Result<()>>> = Vec::new();
-    for (_, devs) in devices.get().iter() {
-        let plat_devs: Vec<*mut std::ffi::c_void> = devs.iter().map(|d| d.id()).collect();
-        if !plat_devs.is_empty() {
-            let context = Arc::new(
-                context::Context::from_devices(&plat_devs, &[0], None, null_mut())?,
-            );
-            let p_devices: Vec<Arc<device::Device>> = plat_devs
-                .iter()
-                .map(|d| Arc::new(device::Device::new(*d)))
-                .collect();
-            let program = Arc::new(
-                program::Program::create_and_build_from_source(
-                    &context,
-                    KERNEL_MYERS_CONTENTS,
-                    &compile_defs,
-                )
-                .map_err(|err| {
-                    eprintln!("{}", err);
-                })
-                .unwrap(),
-            );
-
-            for p_dev in p_devices {
-                let t_dest = dest.clone();
-                let t_recv = recv.clone();
-                let t_context = context.clone();
-                let t_prog = program.clone();
-                let t_peq = peq_array.clone();
-                let t_pat_b4 = pattern_bit4_arc.clone();
-                let t_pam_off = pam_off_arc.clone();
-                let t_pam_filt = pam_filt_arc.clone();
-                let t_pat = patterns_arc.clone();
-                threads.push(thread::spawn(move || unsafe {
-                    search_device_ocl_myers(
-                        max_mismatches,
-                        max_dna_bulges,
-                        max_rna_bulges,
-                        t_peq,
-                        t_pat_b4,
-                        t_pam_off,
-                        t_pam_filt,
-                        n_patterns,
-                        n_fwd_patterns,
-                        t_pat,
-                        t_context,
-                        t_prog,
-                        p_dev,
-                        t_recv,
-                        t_dest,
-                        out_buf_size,
-                    )
-                }));
-            }
-        }
+    for ctx in devices.contexts().iter().cloned() {
+        let t_dest = dest.clone();
+        let t_recv = recv.clone();
+        let t_peq = peq_array.clone();
+        let t_pat_b4 = pattern_bit4_arc.clone();
+        let t_pam_off = pam_off_arc.clone();
+        let t_pam_filt = pam_filt_arc.clone();
+        let t_pat = patterns_arc.clone();
+        let t_ptx = ptx_source.clone();
+        threads.push(thread::spawn(move || {
+            search_device_cuda_myers(
+                t_peq,
+                t_pat_b4,
+                t_pam_off,
+                t_pam_filt,
+                n_patterns,
+                n_fwd_patterns,
+                t_pat,
+                ctx,
+                t_ptx,
+                t_recv,
+                t_dest,
+                out_buf_size,
+            )
+        }));
     }
     for t in threads {
         t.join().unwrap()?;
@@ -1705,7 +1601,7 @@ pub fn search(
                 compute_send_dest,
             );
         } else {
-            match search_chunk_ocl_myers(
+            match search_chunk_cuda_myers(
                 devices,
                 max_mismatches,
                 max_dna_bulges,
@@ -1718,7 +1614,7 @@ pub fn search(
             ) {
                 Ok(_) => {}
                 Err(err_int) => {
-                    panic!("{}", err_int.to_string())
+                    panic!("{:?}", err_int)
                 }
             };
         }
@@ -1746,7 +1642,7 @@ pub fn search(
                 compute_send_dest,
             );
         } else {
-            match search_chunk_ocl(
+            match search_chunk_cuda(
                 devices,
                 max_mismatches,
                 pattern_len,
@@ -1756,7 +1652,7 @@ pub fn search(
             ) {
                 Ok(_) => {}
                 Err(err_int) => {
-                    panic!("{}", err_int.to_string())
+                    panic!("{:?}", err_int)
                 }
             };
         }

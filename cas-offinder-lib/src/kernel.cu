@@ -7,7 +7,12 @@
 // from the OpenCL version verbatim so the host logic (main.rs post-hoc
 // filter, head-overlap dedup) stays unchanged.
 
-#include <cstdint>
+// nvrtc JIT doesn't have access to host <stdint.h> / <cstdint>, so declare
+// the fixed-width ints we use locally.
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+typedef unsigned long long uint64_t;
 
 #ifndef PATTERN_LEN
 #define PATTERN_LEN 27
@@ -51,12 +56,18 @@ extern "C" __global__ void find_matches(
     const block_ty* __restrict__ pattern_blocks,
     uint32_t max_mismatches,
     uint32_t match_start_min_nucl,
+    uint32_t n_genome_execs,
+    uint32_t n_patterns,
     s_match* __restrict__ match_buffer,
     int* __restrict__ entrycount
 ) {
-    size_t genome_idx =
-        ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * BLOCKS_PER_EXEC;
-    size_t pattern_block_idx = (size_t)blockIdx.y * blockDim.y + threadIdx.y;
+    uint32_t exec_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t pattern_block_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    // CUDA rounds the grid up to a multiple of the block size, so ignore the
+    // trailing threads that would otherwise read past `n_genome_execs`.
+    if (exec_idx >= n_genome_execs) return;
+    if (pattern_block_idx >= n_patterns) return;
+    size_t genome_idx = (size_t)exec_idx * BLOCKS_PER_EXEC;
 
     block_ty shifted_blocks[BLOCKS_PER_PATTERN + BLOCKS_PER_EXEC];
     for (size_t i = 0; i < BLOCKS_PER_PATTERN + BLOCKS_PER_EXEC; i++) {

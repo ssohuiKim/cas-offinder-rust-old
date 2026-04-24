@@ -18,7 +18,12 @@
 //   PATTERN_LEN, PAM_LEN, MAX_EDITS, MAX_MISMATCHES, MAX_DNA_BULGES,
 //   MAX_RNA_BULGES, TEXT_WINDOW, OUT_BUF_SIZE
 
-#include <cstdint>
+// nvrtc JIT doesn't have access to host <stdint.h> / <cstdint>, so declare
+// the fixed-width ints we use locally.
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+typedef unsigned long long uint64_t;
 
 #ifndef PATTERN_LEN
 #define PATTERN_LEN 27
