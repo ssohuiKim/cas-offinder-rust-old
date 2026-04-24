@@ -31,3 +31,4 @@ opencl3
 /GRCh38.primary_assembly.genome.fa.gz
 /test_*
 /time_*
+/benchmark/*

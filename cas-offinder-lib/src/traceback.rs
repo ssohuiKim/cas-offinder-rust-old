@@ -325,10 +325,21 @@ fn enumerate(
         }
     }
 
-    // RNA bulge: pattern[i-1] consumed, no text char.
+    // RNA bulge: pattern[i-1] consumed (skipped from the text alignment).
+    //
+    // cas-offinder-bulge (C++) forbids RNA bulges that would skip a PAM N
+    // OR a crRNA position adjacent to the PAM — skipping the crRNA base
+    // next to the PAM effectively shortens the guide by one, which cas-
+    // offinder does not allow (the pattern length is fixed). We mirror
+    // that convention here so Rust and C++ enumerate the same set.
     if rb < max_rna && max_rna > 0 {
         let pattern_pos_is_n = pam_is_n[i - 1];
-        if !pattern_pos_is_n {
+        // PAM-last: pattern[i-1] is the last crRNA base when pam_is_n[i] is
+        // true. PAM-first: pattern[i-1] is the first crRNA base when
+        // pam_is_n[i-2] is true.
+        let next_is_pam = i < pattern_bit4.len() && pam_is_n[i];
+        let prev_is_pam = i >= 2 && pam_is_n[i - 2];
+        if !pattern_pos_is_n && !next_is_pam && !prev_is_pam {
             ops.push(EditOp::RnaBulge);
             enumerate(
                 i - 1, j, ops,

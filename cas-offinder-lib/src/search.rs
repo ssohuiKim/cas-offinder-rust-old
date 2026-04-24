@@ -737,11 +737,13 @@ fn classify_myers_candidate(
 /// `pam_offset`: distance from alignment start to PAM start in pattern
 /// `pam_filter`: bit4 filter values for the PAM positions only (length = pam_len)
 ///
-/// DNA bulges shift the alignment start leftward. For PAM-first patterns
-/// (pam_offset == 0), PAM position depends on the actual bulge count in this
-/// candidate, which we don't know yet. So we try each possible bulge count in
-/// [0, max_dna_bulges] and accept if any shift yields a valid PAM.
-/// For PAM-last patterns, PAM is anchored to end_pos and unaffected by bulges.
+/// For PAM-first patterns (pam_offset == 0) the genome-side PAM position is
+/// `end_pos + 1 - (pattern_len + b_dna - b_rna) + pam_offset + k`, so it
+/// shifts by `b_rna - b_dna`. We sweep every (b_dna, b_rna) combination and
+/// accept if any of them yields a matching PAM. For PAM-last patterns the
+/// genome PAM sits at `end_pos - pam_len + 1 + k` regardless of bulges (RNA
+/// bulges may not lie in the PAM region, and DNA bulges before the PAM don't
+/// move the anchor from `end_pos`) so a single check is enough.
 fn check_pam_quick(
     genome_bit4: &[u8],
     total_nucl: usize,
@@ -750,42 +752,47 @@ fn check_pam_quick(
     pam_offset: usize,
     pam_filter: &[u8],
     max_dna_bulges: u32,
+    max_rna_bulges: u32,
 ) -> bool {
-    let shift_range: usize = if pam_offset == 0 {
-        max_dna_bulges as usize + 1
+    let (db_range, rb_range) = if pam_offset == 0 {
+        (max_dna_bulges as i64 + 1, max_rna_bulges as i64 + 1)
     } else {
-        1
+        (1i64, 1i64)
     };
-    for b in 0..shift_range {
-        let align_start = match (end_pos + 1).checked_sub(pattern_len + b) {
-            Some(x) => x,
-            None => continue,
-        };
-        let mut ok = true;
-        for (k, &f) in pam_filter.iter().enumerate() {
-            let gpos = align_start + pam_offset + k;
-            if gpos >= total_nucl {
-                ok = false;
-                break;
+    for b_dna in 0..db_range {
+        for b_rna in 0..rb_range {
+            let genome_span = pattern_len as i64 + b_dna - b_rna;
+            if genome_span <= 0 || genome_span > (end_pos as i64 + 1) {
+                continue;
             }
-            let g = crate::bit4ops::get_bit4(genome_bit4, gpos);
-            // cas-offinder PAM rule: filter N (0xF) accepts any genome base
-            // including genome N; a specific filter base must match the genome
-            // base, and genome N does NOT satisfy a specific filter position.
-            let pos_ok = if f == 0xF {
-                g != 0 // still reject padding
-            } else if g == 0 || g == 0xF {
-                false
-            } else {
-                (g & f) != 0
-            };
-            if !pos_ok {
-                ok = false;
-                break;
+            let align_start = (end_pos + 1) - genome_span as usize;
+            let mut ok = true;
+            for (k, &f) in pam_filter.iter().enumerate() {
+                let gpos = align_start + pam_offset + k;
+                if gpos >= total_nucl {
+                    ok = false;
+                    break;
+                }
+                let g = crate::bit4ops::get_bit4(genome_bit4, gpos);
+                // cas-offinder PAM rule: filter N (0xF) accepts any genome
+                // base including genome N; a specific filter base must match
+                // the genome base, and genome N does NOT satisfy a specific
+                // filter position.
+                let pos_ok = if f == 0xF {
+                    g != 0 // still reject padding
+                } else if g == 0 || g == 0xF {
+                    false
+                } else {
+                    (g & f) != 0
+                };
+                if !pos_ok {
+                    ok = false;
+                    break;
+                }
             }
-        }
-        if ok {
-            return true;
+            if ok {
+                return true;
+            }
         }
     }
     false
@@ -864,6 +871,7 @@ fn search_chunk_myers(
                 pam_offset,
                 pam_filter,
                 max_dna_bulges,
+                max_rna_bulges,
             ) {
                 continue;
             }
