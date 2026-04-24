@@ -89,24 +89,31 @@ __kernel void find_matches_myers(
     if (j < active_start_nucl) return;       // skip head-overlap positions
     if (j + 1 < PATTERN_LEN) return;
 
-    // ---- PAM pre-check: try each possible DNA bulge shift (for PAM-first
-    // patterns PAM position in genome shifts with bulge count; for PAM-last
-    // it's anchored to j). If any shift has the PAM bases present, accept.
+    // ---- PAM pre-check. For PAM-first patterns (pam_offset == 0) the
+    // genome-side PAM sits at `j + 1 - (PATTERN_LEN + b_dna - b_rna)` and so
+    // shifts by `b_rna - b_dna`; we sweep every (b_dna, b_rna) pair. For
+    // PAM-last patterns the PAM anchors at `j - PAM_LEN + 1` regardless of
+    // bulges, so a single pair (0, 0) suffices.
     uint pam_off = (uint)pam_offsets[p];
-    uint pam_shift_range = (pam_off == 0) ? (MAX_DNA_BULGES + 1u) : 1u;
+    uint db_range = (pam_off == 0) ? (MAX_DNA_BULGES + 1u) : 1u;
+    uint rb_range = (pam_off == 0) ? (MAX_RNA_BULGES + 1u) : 1u;
     bool pam_ok = false;
-    for (uint b = 0; b < pam_shift_range; b++) {
-        if (j + 1 < PATTERN_LEN + b) continue;
-        uint align_start_try = j + 1 - PATTERN_LEN - b;
-        bool this_ok = true;
-        for (uint k = 0; k < PAM_LEN; k++) {
-            uint gpos = align_start_try + pam_off + k;
-            if (gpos >= total_nucl) { this_ok = false; break; }
-            uchar g = get_bit4(genome_bit4, gpos);
-            uchar f = pam_filters_bit4[p * PAM_LEN + k];
-            if (!pam_cell_ok(g, f)) { this_ok = false; break; }
+    for (uint b_dna = 0; b_dna < db_range && !pam_ok; b_dna++) {
+        for (uint b_rna = 0; b_rna < rb_range; b_rna++) {
+            int genome_span = (int)PATTERN_LEN + (int)b_dna - (int)b_rna;
+            if (genome_span <= 0) continue;
+            if ((int)(j + 1) < genome_span) continue;
+            uint align_start_try = (j + 1) - (uint)genome_span;
+            bool this_ok = true;
+            for (uint k = 0; k < PAM_LEN; k++) {
+                uint gpos = align_start_try + pam_off + k;
+                if (gpos >= total_nucl) { this_ok = false; break; }
+                uchar g = get_bit4(genome_bit4, gpos);
+                uchar f = pam_filters_bit4[p * PAM_LEN + k];
+                if (!pam_cell_ok(g, f)) { this_ok = false; break; }
+            }
+            if (this_ok) { pam_ok = true; break; }
         }
-        if (this_ok) { pam_ok = true; break; }
     }
     if (!pam_ok) return;
 
@@ -336,11 +343,19 @@ __kernel void find_matches_myers(
         }
 
         // ---- Try RNA bulge (gap in text). ----
+        //
+        // Matches cas-offinder-bulge's rule: forbid RNA bulges that skip a
+        // PAM N OR a crRNA base adjacent to the PAM (one end of the guide).
+        // Must mirror traceback.rs exactly for CPU/GPU parity.
         if (trans == 1) {
             stack[top].trans = 2;
             if (rna_cost != INF_COST && rb < MAX_RNA_BULGES) {
                 uchar pb4 = get_pattern(pattern_bit4, p, cpi - 1);
-                if (pb4 != 0x0F) {
+                uchar next_is_pam = (cpi < PATTERN_LEN)
+                    ? (get_pattern(pattern_bit4, p, cpi) == 0x0F) : 0;
+                uchar prev_is_pam = (cpi >= 2)
+                    ? (get_pattern(pattern_bit4, p, cpi - 2) == 0x0F) : 0;
+                if (pb4 != 0x0F && !next_is_pam && !prev_is_pam) {
                     uchar new_cost = cost + 1;
                     uchar rem = dp[(cpi - 1) * (TEXT_WINDOW + 1) + ctj];
                     if ((uint)new_cost + (uint)rem <= (uint)MAX_EDITS
